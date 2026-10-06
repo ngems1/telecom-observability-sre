@@ -1,0 +1,68 @@
+# Manual rollback (documented procedure: docs/runbooks/deploy-and-rollback.md).
+# Actions > rollback > Run workflow: pick the environment and, optionally, the Helm revision to return to
+# (empty = the previous one). Runs in the GitHub Environment, so its approval rules apply.
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [dev, prod]
+        required: true
+      revision:
+        description: Helm revision to roll back to (empty = previous revision; see `helm history telecom`)
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: helm rollback (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      REVISION: ${{ inputs.revision }}
+      NAMESPACE: telecom-${{ inputs.environment }}
+      RELEASE: telecom
+      CLUSTER: ${{ vars.EKS_CLUSTER_NAME || format('telecom-{0}', inputs.environment) }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ -z "$REVISION" || "$REVISION" =~ ^[0-9]+$ ]] || { echo "::error::revision must be a number"; exit 1; }
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials (OIDC, short-lived)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - name: Connect to EKS
+        run: aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
+      - name: Release history before rollback
+        run: helm history "$RELEASE" -n "$NAMESPACE" --max 10
+      - name: helm rollback
+        run: helm rollback "$RELEASE" ${REVISION:-0} -n "$NAMESPACE" --wait --timeout 10m
+      - name: Smoke test
+        run: ./scripts/smoke-test.sh "$NAMESPACE"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Rollback of ${ENVIRONMENT} to revision ${REVISION:-previous}"
+            echo '```'
+            helm history "$RELEASE" -n "$NAMESPACE" --max 5 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

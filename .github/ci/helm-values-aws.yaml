@@ -1,0 +1,25 @@
+# CI fixture with the same shape as Terraform's `helm_values` output (fake account and ARNs),
+# so `helm lint` / `helm template` / kubeconform exercise the AWS path (IRSA, ECR, ALB Ingress, NetworkPolicy).
+global:
+  region: us-east-1
+image:
+  registry: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+networkPolicy:
+  albSourceCidrs: ["10.20.0.0/20", "10.20.16.0/20"]
+usageApi:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/telecom-ci-usage-api
+  config:
+    sqsQueueUrl: https://sqs.us-east-1.amazonaws.com/123456789012/usage-alerts-ci
+  ingress:
+    enabled: true
+    className: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+notificationService:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/telecom-ci-notification-service
+  config:
+    sqsQueueUrl: https://sqs.us-east-1.amazonaws.com/123456789012/usage-alerts-ci

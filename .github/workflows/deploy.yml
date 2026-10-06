@@ -1,0 +1,103 @@
+# Helm deployment to one environment. Called by ci-cd.yml after a successful build, or run by hand
+# (Actions > deploy > Run workflow) to redeploy any SHA that is already in ECR.
+# The job targets the GitHub Environment of the same name: protect it with required reviewers to get
+# the manual approval gate; the AWS role it assumes only trusts jobs running in that Environment.
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      image-tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [dev, prod]
+        required: true
+      image-tag:
+        description: Commit SHA whose images are already in ECR
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: helm upgrade (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.summary.outputs.url }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      NAMESPACE: telecom-${{ inputs.environment }}
+      RELEASE: telecom
+      CLUSTER: ${{ vars.EKS_CLUSTER_NAME || format('telecom-{0}', inputs.environment) }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$IMAGE_TAG" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::image-tag must be a commit SHA"; exit 1; }
+          [[ "$ENVIRONMENT" =~ ^(dev|prod)$ ]] || { echo "::error::environment must be dev or prod"; exit 1; }
+      # Deploy the chart from the same commit as the images.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.image-tag }}
+      - name: Configure AWS credentials (OIDC, short-lived)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - name: Connect to EKS
+        run: aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
+      - name: Fetch environment values published by Terraform (SSM)
+        run: |
+          aws ssm get-parameter --name "/telecom/${ENVIRONMENT}/helm-values" \
+            --query Parameter.Value --output text > values-aws.yaml
+      - name: Record the revision we are replacing
+        id: before
+        run: echo "revision=$(helm history "$RELEASE" -n "$NAMESPACE" --max 1 -o json 2>/dev/null | jq -r '.[0].revision // empty')" >> "$GITHUB_OUTPUT"
+      - name: helm upgrade (atomic - a rollout that does not become ready is rolled back automatically)
+        run: |
+          helm upgrade --install "$RELEASE" charts/telecom-app \
+            --namespace "$NAMESPACE" \
+            -f "charts/telecom-app/values-${ENVIRONMENT}.yaml" -f values-aws.yaml \
+            --set usageApi.image.tag="$IMAGE_TAG" \
+            --set notificationService.image.tag="$IMAGE_TAG" \
+            --atomic --wait --timeout 10m --history-max 10
+      - name: Smoke test (in-cluster)
+        id: smoke
+        run: ./scripts/smoke-test.sh "$NAMESPACE"
+      - name: Roll back to the previous revision if the smoke test failed
+        if: failure() && steps.smoke.outcome == 'failure' && steps.before.outputs.revision != ''
+        run: |
+          echo "::error::Smoke test failed: rolling back to revision ${{ steps.before.outputs.revision }}"
+          helm rollback "$RELEASE" "${{ steps.before.outputs.revision }}" -n "$NAMESPACE" --wait --timeout 10m
+      - name: Summary
+        id: summary
+        if: always()
+        run: |
+          HOST="$(kubectl -n "$NAMESPACE" get ingress usage-api -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+          if [ -n "$HOST" ]; then echo "url=http://${HOST}/v1/plans" >> "$GITHUB_OUTPUT"; fi
+          {
+            echo "### ${ENVIRONMENT}: \`${IMAGE_TAG}\`"
+            echo '```'
+            helm history "$RELEASE" -n "$NAMESPACE" --max 5 2>/dev/null || true
+            echo '```'
+            if [ -n "$HOST" ]; then echo "API: http://${HOST}/v1/plans"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
