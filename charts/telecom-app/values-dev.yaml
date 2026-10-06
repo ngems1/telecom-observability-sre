@@ -1,6 +1,12 @@
-# Dev namespace: failure injection and synthetic traffic on, small footprint.
+# Dev namespace: failure injection and synthetic traffic on, small footprint, tracing on.
 global:
   environment: dev
+
+otel:
+  endpoint: http://tempo.monitoring.svc.cluster.local:4317
+
+networkPolicy:
+  enabled: true
 
 usageApi:
   replicaCount: 1
@@ -12,6 +18,7 @@ usageApi:
     minAvailable: 0   # single replica in dev: don't block node drains
   config:
     logLevel: DEBUG
+    otelEnabled: true
   chaos:
     enabled: true
 
@@ -21,6 +28,7 @@ notificationService:
     minAvailable: 0
   config:
     logLevel: DEBUG
+    otelEnabled: true
   chaos:
     enabled: true
 

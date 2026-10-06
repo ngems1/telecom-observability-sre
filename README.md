@@ -33,6 +33,23 @@ of an allowance, the API publishes an event; the Notification service turns it i
 | `usage-api` | REST API, owns plans / subscribers / usage in PostgreSQL, publishes events to SQS | 8080 | CPU (HPA) |
 | `notification-service` | Long-polling SQS consumer, idempotent, writes an audit log, "sends" the notification | 8081 (probes + metrics only) | queue depth/age (KEDA later) |
 
+## Project deliverables map
+
+Where each Week 4 deliverable (brief section 9) lives:
+
+| Deliverable | Location |
+|---|---|
+| Architecture diagram | [docs/architecture.md](docs/architecture.md) (runtime, request flow, CI/CD and identity) |
+| Working EKS / container deployment | `services/*/Dockerfile`, `charts/telecom-app/`, deployed by `.github/workflows/deploy.yml` |
+| Terraform / IaC | [terraform/](terraform/README.md): VPC, EKS, ECR, SQS + DLQ, RDS, IRSA, GitHub OIDC, CloudWatch, security services |
+| GitHub Actions workflow | [.github/workflows/ci-cd.yml](.github/workflows/ci-cd.yml), `deploy.yml`, `rollback.yml` |
+| Helm deployment artifacts | [charts/telecom-app/](charts/telecom-app) (+ `observability/k8s/` for the monitoring add-ons) |
+| Security scan / findings report | [docs/security.md](docs/security.md), Trivy + Checkov results in GitHub code scanning |
+| CloudWatch and Prometheus/Grafana dashboards | `charts/telecom-app/files/dashboards/`, `terraform/modules/observability` |
+| Cost / optimization analysis | [docs/cost-optimization.md](docs/cost-optimization.md) |
+| Failure / recovery runbook | [docs/failure-scenarios.md](docs/failure-scenarios.md), [docs/runbooks/deploy-and-rollback.md](docs/runbooks/deploy-and-rollback.md) |
+| README and final presentation | this file, [docs/presentation-outline.md](docs/presentation-outline.md) |
+
 ## Why this app fits the project
 
 | Project requirement | Where it shows up |
@@ -51,10 +68,13 @@ services/
   notification-service/ SQS worker + probe/metrics server, Dockerfile, tests
 charts/telecom-app/     Helm chart (both services, loadgen, ServiceMonitors, PrometheusRule, dashboards) + values-dev/prod
   files/rules, files/dashboards   alert rules and Grafana dashboards (used by compose and Helm)
-scripts/                create-queues.sh (real AWS), localstack-init.sh (local)
+scripts/                smoke-test.sh (post-deploy), create-queues.sh (quick AWS path), localstack-init.sh (local)
 observability/          Prometheus + Grafana provisioning for the local stack
-docs/failure-scenarios.md   Runbook for the failure tests
-docker-compose.yml, Makefile
+  k8s/                  values for kube-prometheus-stack (Alertmanager -> SNS) and Tempo on EKS
+terraform/              AWS infrastructure as code (state bootstrap, modules, dev/prod settings, add-on scripts)
+.github/workflows/      ci-cd (test, scan, build, push, deploy), deploy (reusable), rollback
+docs/                   architecture, security report, cost analysis, failure scenarios, runbooks, presentation outline
+docker-compose.yml, Makefile, ruff.toml, .checkov.yaml, .trivyignore
 ```
 
 ## Quick start (local, Docker Desktop)
@@ -205,15 +225,19 @@ Purple markers on every graph show when a failure injection was active, so you c
 
 The burn-rate alerts use the multi-window, multi-burn-rate method: a long window proves the budget is really being
 spent, a short window proves it is still burning now. The 3-day and 1-day "ticket" windows from the Google SRE
-workbook are left out because a demo does not run that long; add them for a real service. Alertmanager (routing to
-Slack / PagerDuty / e-mail) is the next step; the `severity` and `owner` labels are what you would route on.
+workbook are left out because a demo does not run that long; add them for a real service.
+
+On EKS, Alertmanager routes on those labels (`observability/k8s/kube-prometheus-stack.yaml`): `critical` and `warning`
+go to the same SNS topic as the CloudWatch alarms (e-mail subscription), critical repeats hourly, a critical alert
+inhibits the warning with the same name, and `info` stays on the dashboards. The EKS control-plane targets that cannot
+be scraped are switched off so the default rules do not page on them.
 
 On EKS, set `monitoring.prometheusRule.enabled=true` and `monitoring.grafanaDashboards.enabled=true` (both on in
 `values-dev.yaml` and `values-prod.yaml`). The chart then creates a `PrometheusRule` and one ConfigMap per dashboard
 labelled `grafana_dashboard: "1"`, which kube-prometheus-stack's Grafana sidecar picks up. The `monitoring.serviceMonitor.labels`
 value (default `release: kube-prometheus-stack`) must match your Prometheus' rule/monitor selectors. Dashboards assume a
-Prometheus data source with uid `prometheus` (the kube-prometheus-stack default). Queue depth/age and RDS panels come from
-CloudWatch; add them with Grafana's CloudWatch data source.
+Prometheus data source with uid `prometheus` (the kube-prometheus-stack default). Queue depth/age, RDS and node panels are on
+the CloudWatch dashboard `telecom-<env>-aws-services` that Terraform creates, next to the matching CloudWatch alarms.
 
 ## Correlation across services
 
@@ -225,11 +249,21 @@ Every request gets a correlation ID (`X-Correlation-ID` header, generated if abs
 4. put in the SQS message **attributes** and the event body,
 5. restored by the Notification service, so its logs carry the same ID.
 
-In CloudWatch Logs Insights: `fields @timestamp, service, message | filter correlation_id = "demo-1" | sort @timestamp`.
+On EKS the container logs reach CloudWatch through Container Insights, which nests each JSON line under `log_processed`.
+Terraform saves ready-made Logs Insights queries (`telecom-<env>/01-follow-a-correlation-id`, errors by service, slow
+requests, notification outcomes, failure-injection audit). By hand:
+
+```
+fields @timestamp, log_processed.service, log_processed.message
+| filter log_processed.correlation_id = "demo-1"
+| sort @timestamp asc
+```
 
 Optional tracing: set `OTEL_ENABLED=true` and `OTEL_EXPORTER_OTLP_ENDPOINT` (Helm: `otel.endpoint`,
 `*.config.otelEnabled`). FastAPI, SQLAlchemy and boto3 calls are instrumented, the W3C `traceparent` travels in the SQS
 attributes, and the consumer continues the producer's trace. `trace_id` is added to the logs when tracing is on.
+In dev on EKS tracing is on by default and goes to Tempo (installed by `terraform/scripts/install-addons.sh`), visible in
+Grafana's *Explore > Tempo*.
 
 ## Configuration (environment variables)
 
@@ -246,45 +280,33 @@ attributes, and the consumer continues the producer's trace. `trace_id` is added
 | `LOG_LEVEL`, `ENVIRONMENT`, `SERVICE_NAME` | `INFO`, `dev` | both |
 | `OTEL_ENABLED` | `false` | both |
 
-## Deploying to EKS
+## Deploying to AWS (EKS)
 
-Prerequisites: an EKS cluster, metrics-server (HPA), AWS Load Balancer Controller (if using the Ingress), and for
-`ServiceMonitor`s the Prometheus Operator CRDs (kube-prometheus-stack).
+The full path is code, end to end:
+
+1. **Infrastructure:** `terraform/` builds the VPC, EKS, ECR, SQS + DLQ, RDS, IAM roles (IRSA and GitHub OIDC), CloudWatch
+   alarms, dashboard and saved queries, and the security services. It also publishes the Helm wiring for each environment
+   (registry, queue URL, role ARNs, ALB subnets) to SSM. See [terraform/README.md](terraform/README.md).
+2. **Cluster add-ons:** `terraform/scripts/install-addons.sh dev` installs metrics-server, the AWS Load Balancer Controller,
+   kube-prometheus-stack (with Alertmanager -> SNS) and Tempo; `terraform/scripts/sync-db-secret.sh dev` creates the
+   namespace and the database Secret from Secrets Manager.
+3. **Application:** push to `main`. GitHub Actions tests, scans and builds the images (tag = commit SHA), pushes them to ECR
+   with OIDC credentials and deploys with `helm upgrade --atomic`, then runs `scripts/smoke-test.sh`. Setup and rollback:
+   [docs/runbooks/deploy-and-rollback.md](docs/runbooks/deploy-and-rollback.md).
+
+Dev and prod are separate namespaces with separate values files (`values-dev.yaml`: failure injection, load generator and
+tracing on; `values-prod.yaml`: failure injection and load generator off, `seedSubscribers: 0`), separate queues and databases.
+Both enable the NetworkPolicies (default deny; the API accepts traffic only from the ALB subnets, its own namespace and Prometheus).
+
+Manual deploy without CI (for example the very first time):
 
 ```bash
-# 1. Images -> ECR (CI should do this with GitHub OIDC and SHA tags)
-ACCOUNT=123456789012; REGION=us-east-1; TAG=$(git rev-parse --short HEAD)
-aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT.dkr.ecr.$REGION.amazonaws.com
-for svc in usage-api notification-service; do
-  aws ecr create-repository --repository-name telecom/$svc >/dev/null 2>&1 || true
-  docker build -t $ACCOUNT.dkr.ecr.$REGION.amazonaws.com/telecom/$svc:$TAG services/$svc
-  docker push        $ACCOUNT.dkr.ecr.$REGION.amazonaws.com/telecom/$svc:$TAG
-done
-
-# 2. Queue + DLQ (Terraform should own this later)
-ENVIRONMENT=dev ./scripts/create-queues.sh        # prints the queue URL
-
-# 3. Database secret (normally synced from AWS Secrets Manager by External Secrets)
-kubectl create namespace telecom-dev
-kubectl -n telecom-dev create secret generic usage-db-credentials \
-  --from-literal=DATABASE_URL='postgresql+psycopg://USER:PASSWORD@RDS_ENDPOINT:5432/telecom'
-
-# 4. Deploy
-helm upgrade --install telecom charts/telecom-app -n telecom-dev -f charts/telecom-app/values-dev.yaml \
-  --set image.registry=$ACCOUNT.dkr.ecr.$REGION.amazonaws.com \
-  --set usageApi.image.tag=$TAG --set notificationService.image.tag=$TAG \
-  --set usageApi.config.sqsQueueUrl=<queue-url> --set notificationService.config.sqsQueueUrl=<queue-url> \
-  --set-string usageApi.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::$ACCOUNT:role/telecom-usage-api \
-  --set-string notificationService.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::$ACCOUNT:role/telecom-notification-service
+terraform -chdir=terraform output -raw helm_values > values-aws.generated.yaml
+helm upgrade --install telecom charts/telecom-app -n telecom-dev \
+  -f charts/telecom-app/values-dev.yaml -f values-aws.generated.yaml \
+  --set usageApi.image.tag=$TAG --set notificationService.image.tag=$TAG --atomic --wait
+./scripts/smoke-test.sh telecom-dev
 ```
-
-IAM (least privilege, via IRSA / Pod Identity): `usage-api` needs `sqs:SendMessage` and `sqs:GetQueueAttributes` on the
-queue; `notification-service` needs `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`.
-
-Dev and prod are separate namespaces with separate values files (`values-dev.yaml`: chaos + load generator on;
-`values-prod.yaml`: both off, `seedSubscribers: 0`). Each environment should use its own queue and database.
-
-Roll back with `helm rollback telecom <revision> -n telecom-dev`.
 
 ## Tests
 
@@ -315,17 +337,24 @@ On Windows PowerShell activate with `.venv\Scripts\Activate.ps1`.
 - **One uvicorn worker per container.** Kubernetes scales by pods; it keeps Prometheus metrics exact.
 - **Notification concurrency.** One consumer thread per pod; scale by replicas. CPU is a poor autoscaling signal for a queue
   worker - KEDA on `ApproximateNumberOfMessagesVisible` is the better next step (HPA is off for it by default).
-- **Dependencies use lower bounds.** Pin and lock them (e.g. `pip-compile`) before relying on this in CI/CD.
-- **Not included yet:** Terraform, GitHub Actions pipeline, Alertmanager routing, CloudWatch panels/alarms, External Secrets
-  manifests, network policies. They are the natural next steps for Days 1-4 of the plan.
+- **Dependencies use lower bounds.** Each image is reproducible by its SHA tag, but a lock file (e.g. `pip-compile`) would make
+  rebuilds reproducible too.
+- **Next steps, not included:** External Secrets Operator (the DB secret is synced by script), KEDA for the consumer, WAF and
+  HTTPS on the ALB, egress NetworkPolicies, transactional outbox, Alembic migrations. See also `docs/security.md` section 5.
 
 ## Verification status
 
-What was checked while building this: the pure-logic unit tests (threshold crossing, message parsing/handling, failure
-injection) run and pass; every Python file parses and has no undefined names; the Helm chart's templates were rendered for
-the default, dev, prod and ingress/registry variants and the output validated as Kubernetes-shaped YAML with consistent
-selectors, ports and service accounts; `docker-compose.yml` parses; the load generator was run against a stub server.
+**Verified by running it:** the local stack (`docker compose`, both profiles) on Docker Desktop: readiness of both services,
+a usage record crossing 80 % and 100 % producing two events that were consumed and "sent"; Prometheus loaded all 20 rules
+with no evaluation errors and every dashboard query returned data; Grafana provisioned both dashboards; the stuck-queue
+scenario fired `NotificationConsumerStalled` about 3 minutes after injection while both probes stayed at 200, and cleared
+after recovery. The pure-logic unit tests pass.
 
-**Not run yet** (the build environment could not install Python packages or run Docker): the FastAPI/SQLAlchemy/boto3
-integration tests, the Docker image builds, `docker compose up`, and `helm lint` against a real Helm. Run the Quick start
-and `pytest` above first; if anything fails, the error message will point at the line.
+**Checked statically only** (the environment that wrote them could not download Terraform, Helm or Python packages):
+the Helm chart renders in every value combination, including the Terraform-shaped values, with strict YAML (no duplicate
+keys) and the expected objects; every Terraform reference, module input and variable resolves and the formatting follows
+`terraform fmt` alignment rules; the workflows are valid YAML; shell scripts pass `bash -n`.
+
+**First real run happens in CI:** the pytest integration suites (FastAPI + moto), `ruff`, `helm lint`, kubeconform,
+`terraform validate`, Trivy and Checkov all run in `ci-cd.yml` on the first push. Expect to fix a few findings there; the
+`terraform apply` itself is the first test of the AWS side.

@@ -29,6 +29,14 @@ spec:
         {{- include "telecom-app.labels" . | nindent 8 }}
     spec:
       serviceAccountName: notification-service
+      automountServiceAccountToken: false
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: notification-service
       # Long enough for the worker to finish its current message and stop polling.
       terminationGracePeriodSeconds: {{ $svc.terminationGracePeriodSeconds }}
       securityContext:

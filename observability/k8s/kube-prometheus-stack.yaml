@@ -1,0 +1,104 @@
+# Values for prometheus-community/kube-prometheus-stack on EKS.
+# Installed by terraform/scripts/install-addons.sh, which adds the environment-specific parts
+# (Alertmanager IRSA role and SNS topic ARN) from `terraform output`.
+
+# The EKS control plane is managed by AWS and cannot be scraped. Without these switches the default
+# rules page you all day with KubeSchedulerDown / KubeControllerManagerDown / etcd alerts (pure noise).
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false   # kube-proxy metrics listen on 127.0.0.1 on EKS nodes
+
+prometheus:
+  prometheusSpec:
+    # Pick up the app chart's ServiceMonitors and PrometheusRule whatever their labels.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    # Cost control: 7 days of metrics is enough for SLO windows (max 6h) and incident review.
+    retention: 7d
+    retentionSize: 8GB
+    resources:
+      requests: { cpu: 200m, memory: 1Gi }
+      limits: { memory: 2Gi }
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+alertmanager:
+  serviceAccount:
+    create: true
+    name: alertmanager          # IRSA trust in Terraform is bound to monitoring/alertmanager
+  alertmanagerSpec:
+    resources:
+      requests: { cpu: 20m, memory: 64Mi }
+      limits: { memory: 128Mi }
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: sns
+      group_by: [alertname, severity, owner]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        - receiver: "null"
+          matchers: ['alertname = "Watchdog"']        # always-firing heartbeat of the stack itself
+        - receiver: "null"
+          matchers: ['alertname = "InfoInhibitor"']
+        - receiver: "null"
+          matchers: ['severity = "info"']             # info alerts stay on dashboards only
+        - receiver: sns
+          matchers: ['severity = "critical"']
+          repeat_interval: 1h                         # critical: remind every hour until fixed
+    inhibit_rules:
+      # A critical alert silences the warning-level alert with the same name (fast burn vs slow burn).
+      - source_matchers: ['severity = "critical"']
+        target_matchers: ['severity = "warning"']
+        equal: [alertname]
+    receivers:
+      - name: "null"
+      - name: sns
+        sns_configs:
+          - topic_arn: SET-BY-INSTALL-SCRIPT          # replaced from `terraform output alarm_topic_arn`
+            sigv4:
+              region: us-east-1
+            send_resolved: true
+
+grafana:
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 2Gi
+  sidecar:
+    datasources:
+      uid: prometheus          # the app dashboards reference this datasource uid
+    dashboards:
+      enabled: true
+      searchNamespace: ALL     # the app chart ships its dashboards as ConfigMaps in the app namespace
+      label: grafana_dashboard
+      labelValue: "1"
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+  additionalDataSources:
+    - name: Tempo
+      type: tempo
+      uid: tempo
+      access: proxy
+      url: http://tempo.monitoring.svc.cluster.local:3200
+      jsonData:
+        serviceMap:
+          datasourceUid: prometheus
+        nodeGraph:
+          enabled: true

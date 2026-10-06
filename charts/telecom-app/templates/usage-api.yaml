@@ -29,7 +29,18 @@ spec:
         {{- include "telecom-app.labels" . | nindent 8 }}
     spec:
       serviceAccountName: usage-api
+      # No Kubernetes API token in the pod: the app never calls the API. IRSA still works
+      # (EKS injects its own projected AWS token volume).
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
+      # Spread replicas across availability zones so one AZ failure does not take the API down.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: usage-api
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -165,12 +176,10 @@ metadata:
   labels:
     app.kubernetes.io/name: usage-api
     {{- include "telecom-app.labels" . | nindent 4 }}
+  {{- /* Chart defaults, overridable: values-supplied annotations win over these (no duplicate keys). */}}
+  {{- $defaults := dict "alb.ingress.kubernetes.io/target-type" "ip" "alb.ingress.kubernetes.io/healthcheck-path" "/readyz" }}
   annotations:
-    alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/healthcheck-path: /readyz
-    {{- with $svc.ingress.annotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
+    {{- toYaml (merge (deepCopy (default (dict) $svc.ingress.annotations)) $defaults) | nindent 4 }}
 spec:
   ingressClassName: {{ $svc.ingress.className }}
   rules:

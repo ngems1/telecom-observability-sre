@@ -1,0 +1,7 @@
+# Trivy ignore list (used by every Trivy step in .github/workflows/ci-cd.yml).
+#
+# Policy: a finding may only be ignored with an owner, a reason and a review date, and it must also be
+# listed in the findings register in docs/security.md. Prefer fixing (base image or dependency bump).
+#
+# Format: one ID per line, optional expiry, e.g.
+#   CVE-2024-12345 exp:2026-12-31   # owner: platform-sre - not reachable: library only used in tests

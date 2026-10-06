@@ -1,0 +1,74 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# Default deny: no inbound traffic reaches this release's pods unless a policy below allows it.
+# Enforcement needs a network-policy engine (on EKS: VPC CNI with enableNetworkPolicy, set in Terraform).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: telecom-default-deny-ingress
+  labels:
+    {{- include "telecom-app.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: telecom-observability
+  policyTypes:
+    - Ingress
+{{- if .Values.usageApi.enabled }}
+---
+# usage-api: from the ALB (public subnets), from pods in this namespace (loadgen, smoke tests)
+# and from Prometheus in the monitoring namespace. Nothing else, including other namespaces.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: usage-api-allow-ingress
+  labels:
+    app.kubernetes.io/name: usage-api
+    {{- include "telecom-app.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: usage-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.monitoringNamespace | quote }}
+        {{- range $np.albSourceCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.usageApi.port }}
+{{- end }}
+{{- if .Values.notificationService.enabled }}
+---
+# notification-service has no public API: only probes (kubelet) and Prometheus scrapes reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notification-service-allow-ingress
+  labels:
+    app.kubernetes.io/name: notification-service
+    {{- include "telecom-app.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: notification-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.monitoringNamespace | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.notificationService.port }}
+{{- end }}
+{{- end }}

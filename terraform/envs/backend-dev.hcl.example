@@ -1,0 +1,7 @@
+# Copy to envs/backend-dev.hcl and fill in the bucket printed by `terraform -chdir=bootstrap output state_bucket`.
+# terraform init -backend-config=envs/backend-dev.hcl
+bucket       = "telecom-tfstate-123456789012-us-east-1"
+key          = "telecom/dev/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true # S3 native locking (Terraform >= 1.10), no DynamoDB table needed

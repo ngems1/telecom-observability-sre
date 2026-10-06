@@ -6,3 +6,6 @@ venv/
 *.db
 .env
 *.tgz
+
+# Terraform-generated Helm values (contain account-specific ARNs)
+values-aws.generated.yaml

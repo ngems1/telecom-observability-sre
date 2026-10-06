@@ -31,9 +31,16 @@ database:
   existingSecret: usage-db-credentials
   secretKey: DATABASE_URL
 
-# OpenTelemetry collector endpoint (OTLP/gRPC). Tracing is enabled per service below.
+# OpenTelemetry endpoint (OTLP/gRPC). Tracing is enabled per service below (config.otelEnabled).
 otel:
-  endpoint: ""   # e.g. http://otel-collector.monitoring.svc.cluster.local:4317
+  endpoint: ""   # e.g. http://tempo.monitoring.svc.cluster.local:4317 (installed by terraform/scripts/install-addons.sh)
+
+# Ingress isolation (default deny + explicit allows). Needs a network-policy engine:
+# on EKS the VPC CNI with enableNetworkPolicy=true (Terraform sets it).
+networkPolicy:
+  enabled: false
+  monitoringNamespace: monitoring   # Prometheus scrapes from here
+  albSourceCidrs: []                # public subnet CIDRs where the ALB lives (Terraform's helm_values fills this)
 
 usageApi:
   enabled: true

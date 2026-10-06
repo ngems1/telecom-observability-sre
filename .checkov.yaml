@@ -1,0 +1,46 @@
+# Checkov configuration used by CI (.github/workflows/ci-cd.yml, job "security").
+# Scans Terraform, the Helm chart *as rendered* (rendered/), Dockerfiles and the GitHub workflows.
+# Every skipped check has a written reason; the same list is reviewed in docs/security.md.
+framework:
+  - terraform
+  - kubernetes
+  - dockerfile
+  - github_actions
+skip-path:
+  - charts            # raw Helm templates are not valid YAML; the rendered output in rendered/ is scanned instead
+  - observability     # Helm values files and local compose provisioning, not Kubernetes objects
+  - .github/ci        # CI fixture with fake values
+compact: true
+quiet: true
+soft-fail: true
+skip-check:
+  # --- EKS
+  - CKV_AWS_39   # public API endpoint enabled: GitHub-hosted runners deploy with Helm; every call is IAM-authenticated
+  - CKV_AWS_38   # public endpoint CIDR 0.0.0.0/0 by default: restrict api_allowed_cidrs to known IPs where possible
+  - CKV_AWS_341  # IMDS hop limit 2: needed by the CloudWatch agent pod; IMDSv2 (tokens) is still required
+  # --- RDS (dev sizing; prod.tfvars turns these on)
+  - CKV_AWS_157  # Multi-AZ off in dev (cost); on in prod.tfvars
+  - CKV_AWS_293  # deletion protection off in dev (teardown); on in prod.tfvars
+  - CKV_AWS_353  # Performance Insights off in dev (not on smallest classes); on in prod.tfvars
+  - CKV_AWS_118  # Enhanced Monitoring not enabled: CloudWatch metrics + Performance Insights in prod are enough here
+  - CKV2_AWS_57  # Secrets Manager rotation not configured: documented limitation (docs/security.md, terraform/README.md)
+  # --- logging / storage (cost decisions, documented in docs/cost-optimization.md)
+  - CKV_AWS_338  # log retention under 1 year: 14 days (dev) / 30 days (prod) by design; CloudTrail keeps 90/365 days in S3
+  - CKV_AWS_144  # S3 cross-region replication: not needed for a lab audit bucket
+  - CKV_AWS_18   # S3 access logging on the CloudTrail bucket: would need another bucket; CloudTrail data events are not enabled
+  - CKV2_AWS_62  # S3 event notifications: not used
+  - CKV_AWS_252  # CloudTrail SNS topic: trail is streamed to CloudWatch Logs instead
+  - CKV_AWS_337  # SSM parameter without CMK: it holds Helm wiring (ARNs, URLs), no secrets
+  # --- IAM policies where Resource "*" is required by the API
+  - CKV_AWS_109  # KMS key policy: Resource "*" means "this key" in a key policy
+  - CKV_AWS_111  # same (KMS key policy / upstream AWS Load Balancer Controller policy)
+  - CKV_AWS_356  # same (ecr:GetAuthorizationToken and the upstream LB controller policy cannot be scoped)
+  # --- Kubernetes (rendered chart)
+  - CKV_K8S_43   # image digest instead of tag: tags are commit SHAs in an IMMUTABLE ECR repository (same guarantee)
+  - CKV_K8S_15   # imagePullPolicy Always: unnecessary with immutable SHA tags; IfNotPresent avoids pulls on restart
+  - CKV_K8S_21   # default namespace: the namespace is set at install time (helm -n telecom-<env>)
+  - CKV_K8S_35   # secrets as env vars: DATABASE_URL comes from a Secret via secretKeyRef; file mount is a possible hardening
+  # --- Dockerfile
+  - CKV_DOCKER_2 # HEALTHCHECK: Kubernetes probes (startup/liveness/readiness) do this job
+  # --- GitHub Actions
+  - CKV_GHA_7    # workflow_dispatch inputs: deploy/rollback inputs are validated (SHA / number regex) before use

@@ -1,0 +1,10 @@
+# Local Terraform state and caches (state lives in S3; see README)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+# Keep .terraform.lock.hcl committed. Real backend/secret values stay local:
+envs/backend-*.hcl
+!envs/backend-*.hcl.example
+values-aws.generated.yaml

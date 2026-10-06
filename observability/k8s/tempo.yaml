@@ -1,0 +1,19 @@
+# Values for grafana/tempo (single binary) on EKS: receives OTLP traces from both services
+# (charts/telecom-app values-dev.yaml points otel.endpoint here) and serves them to Grafana.
+tempo:
+  retention: 72h               # traces are for live debugging; keep storage small
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"
+        http:
+          endpoint: "0.0.0.0:4318"
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 1Gi }
+
+persistence:
+  enabled: true
+  storageClassName: gp3
+  size: 5Gi

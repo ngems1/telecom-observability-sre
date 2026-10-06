@@ -7,6 +7,9 @@ metadata:
     app.kubernetes.io/name: loadgen
     app.kubernetes.io/component: synthetic-traffic
     {{- include "telecom-app.labels" . | nindent 4 }}
+  annotations:
+    checkov.io/skip1: CKV_K8S_8=Traffic generator is a client with no endpoint to probe
+    checkov.io/skip2: CKV_K8S_9=Traffic generator is a client with no endpoint to probe
 spec:
   replicas: 1
   selector:
@@ -19,6 +22,7 @@ spec:
         app.kubernetes.io/component: synthetic-traffic
         {{- include "telecom-app.labels" . | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
