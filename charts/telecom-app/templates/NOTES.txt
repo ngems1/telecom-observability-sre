@@ -1,0 +1,27 @@
+telecom-app {{ .Chart.AppVersion }} installed in namespace {{ .Release.Namespace }} (environment: {{ .Values.global.environment }}).
+
+Check rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/usage-api deploy/notification-service
+  kubectl -n {{ .Release.Namespace }} get pods,hpa,pdb
+
+Try the API:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/usage-api 8080:{{ .Values.usageApi.port }}
+  curl localhost:8080/v1/subscribers?limit=3
+{{- if .Values.usageApi.chaos.enabled }}
+
+Failure injection is ENABLED (not routed by the Ingress; use port-forward):
+  curl -XPOST localhost:8080/chaos/latency -H 'content-type: application/json' -d '{"delay_ms":800}'
+  curl -XPOST localhost:8080/chaos/reset
+{{- end }}
+{{- if .Values.notificationService.chaos.enabled }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/notification-service 8081:{{ .Values.notificationService.port }}
+  curl -XPOST localhost:8081/chaos/stall -H 'content-type: application/json' -d '{"enabled":true}'
+{{- end }}
+{{- if not .Values.usageApi.config.sqsQueueUrl }}
+
+WARNING: usageApi.config.sqsQueueUrl is empty - alert events will not be published.
+{{- end }}
+{{- if not .Values.notificationService.config.sqsQueueUrl }}
+
+WARNING: notificationService.config.sqsQueueUrl is empty - the worker will not start.
+{{- end }}

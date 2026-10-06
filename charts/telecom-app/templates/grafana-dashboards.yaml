@@ -1,0 +1,18 @@
+{{- if .Values.monitoring.grafanaDashboards.enabled }}
+{{- range $path, $_ := .Files.Glob "files/dashboards/*.json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "telecom-dashboard-%s" (base $path | trimSuffix ".json") }}
+  labels:
+    # kube-prometheus-stack's Grafana sidecar loads every ConfigMap with this label.
+    grafana_dashboard: "1"
+    {{- include "telecom-app.labels" $ | nindent 4 }}
+  annotations:
+    grafana_folder: Telecom
+data:
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

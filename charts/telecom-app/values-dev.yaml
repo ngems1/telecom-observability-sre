@@ -1,0 +1,37 @@
+# Dev namespace: failure injection and synthetic traffic on, small footprint.
+global:
+  environment: dev
+
+usageApi:
+  replicaCount: 1
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 3
+  podDisruptionBudget:
+    minAvailable: 0   # single replica in dev: don't block node drains
+  config:
+    logLevel: DEBUG
+  chaos:
+    enabled: true
+
+notificationService:
+  replicaCount: 1
+  podDisruptionBudget:
+    minAvailable: 0
+  config:
+    logLevel: DEBUG
+  chaos:
+    enabled: true
+
+loadgen:
+  enabled: true
+  rps: 5
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+  grafanaDashboards:
+    enabled: true

@@ -1,0 +1,14 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: telecom-slo-rules
+  labels:
+    app.kubernetes.io/name: telecom-slo-rules
+    {{- include "telecom-app.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+{{ .Files.Get "files/rules/telecom.rules.yaml" | indent 2 }}
+{{- end }}

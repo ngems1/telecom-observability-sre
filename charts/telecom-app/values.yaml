@@ -1,0 +1,120 @@
+# Defaults are safe for production: chaos tooling and the load generator are OFF.
+# Use values-dev.yaml / values-prod.yaml on top of this file.
+
+global:
+  environment: dev
+  region: us-east-1
+
+image:
+  # ECR registry host, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com (empty = local images)
+  registry: ""
+  pullPolicy: IfNotPresent
+
+# Pod-level hardening applied to every workload.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# Database credentials come from an existing Secret (e.g. synced from AWS Secrets Manager by
+# External Secrets). The key must hold a SQLAlchemy URL: postgresql+psycopg://user:pw@host:5432/db
+database:
+  existingSecret: usage-db-credentials
+  secretKey: DATABASE_URL
+
+# OpenTelemetry collector endpoint (OTLP/gRPC). Tracing is enabled per service below.
+otel:
+  endpoint: ""   # e.g. http://otel-collector.monitoring.svc.cluster.local:4317
+
+usageApi:
+  enabled: true
+  image:
+    repository: telecom/usage-api
+    tag: ""            # defaults to .Chart.AppVersion; CI should set the commit SHA
+  replicaCount: 2      # ignored while autoscaling is enabled
+  port: 8080
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    minAvailable: 1
+  serviceAccount:
+    annotations: {}    # IRSA: eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/usage-api
+  config:
+    logLevel: INFO
+    sqsQueueUrl: ""
+    sqsEndpointUrl: ""   # only for LocalStack/testing
+    alertThresholds: "80,100"
+    seedSubscribers: 25
+    autoMigrate: true
+    otelEnabled: false
+  chaos:
+    enabled: false
+  ingress:
+    enabled: false
+    className: alb
+    host: ""            # e.g. api.example.com
+    annotations: {}     # ALB annotations (scheme, certificate-arn, group.name, ...)
+
+notificationService:
+  enabled: true
+  image:
+    repository: telecom/notification-service
+    tag: ""
+  replicaCount: 2
+  port: 8081
+  resources:
+    requests: { cpu: 50m, memory: 96Mi }
+    limits: { cpu: 300m, memory: 192Mi }
+  autoscaling:
+    enabled: false      # CPU is a poor signal for a queue consumer; use KEDA on queue depth later
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    minAvailable: 1
+  serviceAccount:
+    annotations: {}     # IRSA role needs sqs:ReceiveMessage/DeleteMessage/GetQueueAttributes on the queue
+  terminationGracePeriodSeconds: 40
+  config:
+    logLevel: INFO
+    sqsQueueUrl: ""
+    sqsEndpointUrl: ""
+    waitSeconds: 10
+    staleSeconds: 60
+    otelEnabled: false
+  chaos:
+    enabled: false
+
+# Optional synthetic traffic (dev/test only).
+loadgen:
+  enabled: false
+  rps: 5
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+monitoring:
+  serviceMonitor:
+    enabled: false      # needs the Prometheus Operator CRDs (kube-prometheus-stack)
+    interval: 15s
+    labels:
+      release: kube-prometheus-stack   # must match your Prometheus' serviceMonitorSelector
+  prometheusRule:
+    enabled: false      # recording rules + SLO burn-rate alerts (PrometheusRule CRD)
+  grafanaDashboards:
+    enabled: false      # dashboards as ConfigMaps for the Grafana sidecar (label grafana_dashboard=1)

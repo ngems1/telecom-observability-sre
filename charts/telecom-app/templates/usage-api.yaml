@@ -1,0 +1,193 @@
+{{- if .Values.usageApi.enabled }}
+{{- $svc := .Values.usageApi }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usage-api
+  labels:
+    app.kubernetes.io/name: usage-api
+    app.kubernetes.io/component: api
+    {{- include "telecom-app.labels" . | nindent 4 }}
+spec:
+  {{- if not $svc.autoscaling.enabled }}
+  replicas: {{ $svc.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usage-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: usage-api
+        app.kubernetes.io/component: api
+        {{- include "telecom-app.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: usage-api
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: usage-api
+          image: {{ include "telecom-app.image" (dict "root" . "svc" $svc) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.port }}
+          env:
+            - name: SERVICE_NAME
+              value: usage-api
+            - name: ENVIRONMENT
+              value: {{ .Values.global.environment | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.global.region | quote }}
+            - name: LOG_LEVEL
+              value: {{ $svc.config.logLevel | quote }}
+            - name: SQS_QUEUE_URL
+              value: {{ $svc.config.sqsQueueUrl | quote }}
+            {{- if $svc.config.sqsEndpointUrl }}
+            - name: SQS_ENDPOINT_URL
+              value: {{ $svc.config.sqsEndpointUrl | quote }}
+            {{- end }}
+            - name: ALERT_THRESHOLDS
+              value: {{ $svc.config.alertThresholds | quote }}
+            - name: SEED_SUBSCRIBERS
+              value: {{ $svc.config.seedSubscribers | quote }}
+            - name: AUTO_MIGRATE
+              value: {{ $svc.config.autoMigrate | quote }}
+            - name: CHAOS_ENABLED
+              value: {{ $svc.chaos.enabled | quote }}
+            - name: OTEL_ENABLED
+              value: {{ $svc.config.otelEnabled | quote }}
+            {{- if .Values.otel.endpoint }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.otel.endpoint | quote }}
+            {{- end }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.secretKey }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usage-api
+  labels:
+    app.kubernetes.io/name: usage-api
+    {{- include "telecom-app.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: usage-api
+  ports:
+    - name: http
+      port: {{ $svc.port }}
+      targetPort: http
+{{- if $svc.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: usage-api
+  labels:
+    app.kubernetes.io/name: usage-api
+    {{- include "telecom-app.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: usage-api
+  minReplicas: {{ $svc.autoscaling.minReplicas }}
+  maxReplicas: {{ $svc.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $svc.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: usage-api
+  labels:
+    app.kubernetes.io/name: usage-api
+    {{- include "telecom-app.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ $svc.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usage-api
+{{- if $svc.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: usage-api
+  labels:
+    app.kubernetes.io/name: usage-api
+    {{- include "telecom-app.labels" . | nindent 4 }}
+  annotations:
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /readyz
+    {{- with $svc.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ $svc.ingress.className }}
+  rules:
+    {{- if $svc.ingress.host }}
+    - host: {{ $svc.ingress.host | quote }}
+      http:
+    {{- else }}
+    - http:
+    {{- end }}
+        paths:
+          # Only the public API prefix is routed; /chaos, /demo and /metrics stay cluster-internal.
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: usage-api
+                port:
+                  name: http
+{{- end }}
+{{- end }}

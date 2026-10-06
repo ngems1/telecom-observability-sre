@@ -1,0 +1,33 @@
+# Prod namespace: no chaos endpoints, no synthetic traffic, redundancy on.
+global:
+  environment: prod
+
+usageApi:
+  replicaCount: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+  config:
+    logLevel: INFO
+    seedSubscribers: 0
+  chaos:
+    enabled: false
+
+notificationService:
+  replicaCount: 2
+  config:
+    logLevel: INFO
+  chaos:
+    enabled: false
+
+loadgen:
+  enabled: false
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+  grafanaDashboards:
+    enabled: true

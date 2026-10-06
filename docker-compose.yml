@@ -1,0 +1,114 @@
+# Local stack: PostgreSQL + LocalStack (SQS) + both services.
+#   docker compose up --build -d
+#   docker compose --profile loadgen up -d loadgen          # traffic
+#   docker compose --profile observability up -d            # Prometheus :9090 (rules/alerts), Grafana :3000 (dashboards)
+name: telecom-observability
+
+x-service-env: &service-env
+  ENVIRONMENT: local
+  CHAOS_ENABLED: "true"
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_ENDPOINT_URL: http://localstack:4566
+  SQS_QUEUE_URL: http://localstack:4566/000000000000/usage-alerts-dev
+  DATABASE_URL: postgresql+psycopg://telecom:telecom@postgres:5432/telecom
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: telecom
+      POSTGRES_PASSWORD: telecom
+      POSTGRES_DB: telecom
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telecom -d telecom"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    # Pinned: newer "latest" LocalStack images may require an account/auth token.
+    image: localstack/localstack:3.8.1
+    environment:
+      SERVICES: sqs
+    ports: ["4566:4566"]
+    volumes:
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/10-queues.sh:ro
+    healthcheck:
+      # Healthy only once the init script has created the queue.
+      test: ["CMD-SHELL", "awslocal sqs list-queues | grep -q usage-alerts-dev"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  usage-api:
+    build: ./services/usage-api
+    restart: unless-stopped
+    environment:
+      <<: *service-env
+      SERVICE_NAME: usage-api
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      localstack: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  notification-service:
+    build: ./services/notification-service
+    restart: unless-stopped
+    environment:
+      <<: *service-env
+      SERVICE_NAME: notification-service
+      SQS_WAIT_SECONDS: "5"
+    ports: ["8081:8081"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      localstack: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  loadgen:
+    profiles: ["loadgen"]
+    build: ./services/usage-api
+    command: ["python", "tools/loadgen.py", "--base-url", "http://usage-api:8080", "--rps", "5"]
+    depends_on:
+      usage-api: { condition: service_healthy }
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v2.55.1
+    ports: ["9090:9090"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./charts/telecom-app/files/rules:/etc/prometheus/rules:ro
+    depends_on: [usage-api, notification-service]
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:11.3.0
+    ports: ["3000:3000"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/slo-overview.json
+    volumes:
+      - ./observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./observability/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./charts/telecom-app/files/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+
+volumes:
+  pgdata:

@@ -1,0 +1,208 @@
+# Recording rules and alerts for the telecom usage-alerts platform.
+#
+# Single source of truth: mounted into Prometheus by docker-compose and embedded in the
+# Helm chart's PrometheusRule. Edit here only.
+#
+# SLOs (adjust to what you define in your project):
+#   API availability  99.9 %  non-5xx            -> error budget 0.001
+#   API latency       95 %    of requests < 300ms -> error budget 0.05
+#
+# Alerting follows the multi-window, multi-burn-rate method: an alert needs BOTH a long window
+# (is the budget really burning?) and a short window (is it still burning right now?).
+# burn rate = observed bad ratio / error budget.
+groups:
+  - name: telecom.sli.recording
+    interval: 30s
+    rules:
+      # ---- API error ratio (share of 5xx among real traffic; probes and scrapes excluded)
+      - record: sli:api_error_ratio:rate5m
+        expr: |
+          (sum(rate(http_requests_total{service="usage-api",status=~"5..",route!~"/healthz|/readyz|/metrics"}[5m])) or vector(0))
+          / sum(rate(http_requests_total{service="usage-api",route!~"/healthz|/readyz|/metrics"}[5m]))
+      - record: sli:api_error_ratio:rate30m
+        expr: |
+          (sum(rate(http_requests_total{service="usage-api",status=~"5..",route!~"/healthz|/readyz|/metrics"}[30m])) or vector(0))
+          / sum(rate(http_requests_total{service="usage-api",route!~"/healthz|/readyz|/metrics"}[30m]))
+      - record: sli:api_error_ratio:rate1h
+        expr: |
+          (sum(rate(http_requests_total{service="usage-api",status=~"5..",route!~"/healthz|/readyz|/metrics"}[1h])) or vector(0))
+          / sum(rate(http_requests_total{service="usage-api",route!~"/healthz|/readyz|/metrics"}[1h]))
+      - record: sli:api_error_ratio:rate6h
+        expr: |
+          (sum(rate(http_requests_total{service="usage-api",status=~"5..",route!~"/healthz|/readyz|/metrics"}[6h])) or vector(0))
+          / sum(rate(http_requests_total{service="usage-api",route!~"/healthz|/readyz|/metrics"}[6h]))
+
+      # ---- API slow ratio (share of requests slower than 300 ms; uses the le="0.3" bucket)
+      - record: sli:api_slow_ratio:rate5m
+        expr: |
+          1 - (
+            sum(rate(http_request_duration_seconds_bucket{service="usage-api",le="0.3",route!~"/healthz|/readyz|/metrics"}[5m]))
+            / sum(rate(http_request_duration_seconds_count{service="usage-api",route!~"/healthz|/readyz|/metrics"}[5m]))
+          )
+      - record: sli:api_slow_ratio:rate30m
+        expr: |
+          1 - (
+            sum(rate(http_request_duration_seconds_bucket{service="usage-api",le="0.3",route!~"/healthz|/readyz|/metrics"}[30m]))
+            / sum(rate(http_request_duration_seconds_count{service="usage-api",route!~"/healthz|/readyz|/metrics"}[30m]))
+          )
+      - record: sli:api_slow_ratio:rate1h
+        expr: |
+          1 - (
+            sum(rate(http_request_duration_seconds_bucket{service="usage-api",le="0.3",route!~"/healthz|/readyz|/metrics"}[1h]))
+            / sum(rate(http_request_duration_seconds_count{service="usage-api",route!~"/healthz|/readyz|/metrics"}[1h]))
+          )
+      - record: sli:api_slow_ratio:rate6h
+        expr: |
+          1 - (
+            sum(rate(http_request_duration_seconds_bucket{service="usage-api",le="0.3",route!~"/healthz|/readyz|/metrics"}[6h]))
+            / sum(rate(http_request_duration_seconds_count{service="usage-api",route!~"/healthz|/readyz|/metrics"}[6h]))
+          )
+
+  - name: telecom.slo.alerts
+    rules:
+      - alert: ApiAvailabilityFastBurn
+        expr: sli:api_error_ratio:rate1h > (14.4 * 0.001) and sli:api_error_ratio:rate5m > (14.4 * 0.001)
+        for: 1m
+        labels:
+          severity: critical
+          owner: platform-sre
+          slo: api-availability
+        annotations:
+          summary: "usage-api is burning its availability error budget fast"
+          description: "5xx ratio is {{ $value | humanizePercentage }} over the last hour and still elevated in the last 5m (budget burns >14x faster than allowed; a 30-day budget would be gone in about 2 days)."
+          runbook: "docs/failure-scenarios.md#scenario-1---pod-failure"
+
+      - alert: ApiAvailabilitySlowBurn
+        expr: sli:api_error_ratio:rate6h > (6 * 0.001) and sli:api_error_ratio:rate30m > (6 * 0.001)
+        for: 5m
+        labels:
+          severity: warning
+          owner: platform-sre
+          slo: api-availability
+        annotations:
+          summary: "usage-api is steadily burning its availability error budget"
+          description: "5xx ratio is {{ $value | humanizePercentage }} over the last 6h and still elevated in the last 30m (budget burns >6x faster than allowed)."
+          runbook: "docs/failure-scenarios.md#scenario-1---pod-failure"
+
+      - alert: ApiLatencyFastBurn
+        # 6x the 5 % slow-request budget = more than 30 % of requests slower than 300 ms.
+        expr: sli:api_slow_ratio:rate1h > (6 * 0.05) and sli:api_slow_ratio:rate5m > (6 * 0.05)
+        for: 1m
+        labels:
+          severity: critical
+          owner: platform-sre
+          slo: api-latency
+        annotations:
+          summary: "usage-api latency SLO is burning fast"
+          description: "{{ $value | humanizePercentage }} of requests took longer than 300 ms over the last hour and the last 5m is also over budget (objective: at most 5 %)."
+          runbook: "docs/failure-scenarios.md#scenario-2---elevated-latency"
+
+      - alert: ApiLatencySlowBurn
+        expr: sli:api_slow_ratio:rate6h > (2 * 0.05) and sli:api_slow_ratio:rate30m > (2 * 0.05)
+        for: 5m
+        labels:
+          severity: warning
+          owner: platform-sre
+          slo: api-latency
+        annotations:
+          summary: "usage-api latency is degraded for a prolonged period"
+          description: "{{ $value | humanizePercentage }} of requests took longer than 300 ms over the last 6h and still over budget in the last 30m."
+          runbook: "docs/failure-scenarios.md#scenario-2---elevated-latency"
+
+  - name: telecom.pipeline.alerts
+    rules:
+      - alert: NotificationConsumerStalled
+        # The producer keeps publishing alert events but the consumer receives nothing.
+        # Pods stay Ready in this failure mode, so only the producer/consumer comparison catches it.
+        expr: sum(rate(usage_alert_events_total[2m])) > 0 and sum(rate(sqs_messages_received_total[2m])) == 0
+        for: 1m
+        labels:
+          severity: critical
+          owner: notifications-team
+          slo: notification-freshness
+        annotations:
+          summary: "Notification consumer is not receiving messages while events are being produced"
+          description: "usage-api is publishing alert events but notification-service received none in the last 2 minutes. The queue is growing. Pods may look healthy."
+          runbook: "docs/failure-scenarios.md#scenario-3---stuck-queue-processing"
+
+      - alert: NotificationWorkerHeartbeatLost
+        expr: time() - max(notification_worker_last_poll_timestamp_seconds) > 90
+        for: 1m
+        labels:
+          severity: critical
+          owner: notifications-team
+        annotations:
+          summary: "Notification worker loop has stopped iterating"
+          description: "No worker heartbeat for {{ $value | humanizeDuration }}. Liveness should restart the pod; check the logs."
+          runbook: "docs/failure-scenarios.md#scenario-3---stuck-queue-processing"
+
+      - alert: NotificationDeliveryFailures
+        # Failed and invalid messages are retried and then land in the dead-letter queue.
+        expr: sum(rate(notifications_processed_total{result=~"delivery_failed|invalid|error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          owner: notifications-team
+          slo: notification-freshness
+        annotations:
+          summary: "Notifications are failing and will end up in the dead-letter queue"
+          description: "{{ $value | humanize }} messages/s failing (delivery_failed, invalid or error)."
+          runbook: "docs/failure-scenarios.md#bonus-a---poison-message-and-the-dead-letter-queue"
+
+      - alert: NotificationDelayHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(notification_queue_delay_seconds_bucket[5m]))) > 60
+        for: 5m
+        labels:
+          severity: warning
+          owner: notifications-team
+          slo: notification-freshness
+        annotations:
+          summary: "Notifications are delivered too late"
+          description: "p95 delay between the event and the notification is {{ $value | humanizeDuration }} (objective: under 60 s)."
+          runbook: "docs/failure-scenarios.md#scenario-3---stuck-queue-processing"
+
+      - alert: SqsPublishErrors
+        expr: sum(rate(sqs_publish_total{result="error"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+          owner: platform-sre
+        annotations:
+          summary: "usage-api cannot publish to SQS"
+          description: "Usage is still recorded but alert events are being lost ({{ $value | humanize }} errors/s). Check SQS availability and the IAM role."
+          runbook: "docs/failure-scenarios.md"
+
+  - name: telecom.platform.alerts
+    rules:
+      - alert: TargetDown
+        expr: up{job=~"usage-api|notification-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          owner: platform-sre
+        annotations:
+          summary: "{{ $labels.job }} is not being scraped"
+          description: "Prometheus cannot scrape {{ $labels.instance }} ({{ $labels.job }}). The pod may be down or restarting."
+          runbook: "docs/failure-scenarios.md#scenario-1---pod-failure"
+
+      - alert: DatabaseQueriesSlow
+        expr: histogram_quantile(0.95, sum by (le, service) (rate(db_query_duration_seconds_bucket[5m]))) > 0.25
+        for: 5m
+        labels:
+          severity: warning
+          owner: data-platform
+        annotations:
+          summary: "{{ $labels.service }}: database p95 query time is high"
+          description: "p95 query latency is {{ $value | humanizeDuration }}. Check RDS CPU, connections and slow queries."
+          runbook: "docs/failure-scenarios.md"
+
+      - alert: ChaosInjectionActive
+        # Informational: a deliberate failure injection is on, so related alerts are expected.
+        expr: max by (service, type) (chaos_injection_active) == 1
+        labels:
+          severity: info
+          owner: platform-sre
+        annotations:
+          summary: "Failure injection '{{ $labels.type }}' is active on {{ $labels.service }}"
+          description: "A deliberate failure test is running. Clear it with POST /chaos/reset."
+          runbook: "docs/failure-scenarios.md"

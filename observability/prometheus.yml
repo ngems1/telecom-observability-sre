@@ -1,0 +1,22 @@
+# Local Prometheus for docker-compose (profile: observability).
+# On EKS the Helm chart's ServiceMonitors and PrometheusRule are used instead.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+# Recording rules and SLO burn-rate alerts (same file the Helm chart embeds in its PrometheusRule).
+rule_files:
+  - /etc/prometheus/rules/*.yaml
+
+scrape_configs:
+  - job_name: usage-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["usage-api:8080"]
+        labels: { service: usage-api }
+
+  - job_name: notification-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["notification-service:8081"]
+        labels: { service: notification-service }
