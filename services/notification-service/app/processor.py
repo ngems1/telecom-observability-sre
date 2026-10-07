@@ -16,14 +16,24 @@ from .observability import (
     PROCESSED,
     PROCESSING_SECONDS,
     QUEUE_DELAY_SECONDS,
+    SENT_BY_TYPE,
     consumer_span,
     correlation_id_var,
 )
 
 log = logging.getLogger(__name__)
 
-REQUIRED_FIELDS = ("event_id", "type", "subscriber_id", "msisdn", "kind", "threshold_pct", "used", "quota")
+COMMON_FIELDS = ("event_id", "type", "subscriber_id", "msisdn")
+# Fields each event type must carry, on top of COMMON_FIELDS. Unknown types are invalid (-> DLQ).
+EVENT_FIELDS = {
+    "usage.threshold_crossed": ("kind", "threshold_pct", "used", "quota"),
+    "topup.succeeded": ("topup_id", "amount_cents", "balance_cents"),
+    "topup.failed": ("topup_id", "amount_cents", "reason"),
+    "bundle.purchased": ("bundle_name", "price_cents", "balance_cents"),
+}
+REQUIRED_FIELDS = COMMON_FIELDS + EVENT_FIELDS["usage.threshold_crossed"]  # kept for backwards compatibility
 KIND_LABELS = {"data": "data (MB)", "voice": "voice minutes", "sms": "SMS messages"}
+CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£"}
 TRACE_KEYS = ("traceparent", "tracestate")
 
 
@@ -62,15 +72,51 @@ def parse_event(body: str) -> dict:
         raise InvalidEvent(f"body is not valid JSON: {exc}") from exc
     if not isinstance(event, dict):
         raise InvalidEvent("body is not a JSON object")
-    missing = [f for f in REQUIRED_FIELDS if f not in event]
+    missing = [f for f in COMMON_FIELDS if f not in event]
     if missing:
         raise InvalidEvent(f"missing fields: {', '.join(missing)}")
-    if event["kind"] not in KIND_LABELS:
+    fields = EVENT_FIELDS.get(event["type"])
+    if fields is None:
+        raise InvalidEvent(f"unknown event type: {event['type']!r}")
+    missing = [f for f in fields if f not in event]
+    if missing:
+        raise InvalidEvent(f"missing fields: {', '.join(missing)}")
+    if event["type"] == "usage.threshold_crossed" and event["kind"] not in KIND_LABELS:
         raise InvalidEvent(f"unknown kind: {event['kind']!r}")
     return event
 
 
+def money(cents, currency: str = "USD") -> str:
+    symbol = CURRENCY_SYMBOLS.get(currency)
+    amount = f"{int(cents) / 100:,.2f}"
+    return f"{symbol}{amount}" if symbol else f"{amount} {currency}"
+
+
+def notification_kind(event: dict) -> str:
+    """Short category stored with the notification: data/voice/sms for usage alerts, else topup/bundle."""
+    if event["type"] == "usage.threshold_crossed":
+        return event["kind"]
+    return event["type"].split(".", 1)[0][:8]
+
+
 def render_message(event: dict) -> str:
+    event_type = event["type"]
+    currency = event.get("currency", "USD")
+    if event_type == "topup.succeeded":
+        return (
+            f"Top-up successful: {money(event['amount_cents'], currency)} added. "
+            f"Your balance is now {money(event['balance_cents'], currency)}."
+        )
+    if event_type == "topup.failed":
+        amount = money(event["amount_cents"], currency)
+        if event["reason"] == "declined":
+            return f"Your top-up of {amount} was declined by your bank or wallet. You have not been charged."
+        return f"Your top-up of {amount} could not be completed. You have not been charged. Please try again."
+    if event_type == "bundle.purchased":
+        return (
+            f"You bought {event['bundle_name']} for {money(event['price_cents'], currency)}. "
+            f"Remaining balance: {money(event['balance_cents'], currency)}."
+        )
     label = KIND_LABELS[event["kind"]]
     used, quota, pct = event["used"], event["quota"], event["threshold_pct"]
     if pct >= 100:
@@ -149,14 +195,17 @@ class MessageHandler:
             log.info("duplicate event (race) ignored", extra={"event_id": event_id})
             return Outcome.DUPLICATE
 
+        SENT_BY_TYPE.labels(event_type=event["type"]).inc()
         log.info(
             "notification sent",
             extra={
                 "event_id": event_id,
+                "event_type": event["type"],
                 "subscriber_id": event["subscriber_id"],
-                "kind": event["kind"],
-                "threshold_pct": event["threshold_pct"],
+                "kind": notification_kind(event),
+                "threshold_pct": event.get("threshold_pct"),
                 "msisdn_suffix": str(event["msisdn"])[-4:],
+                "sms_text": message,  # what the customer received (no phone number in it)
                 "queue_delay_s": round(queue_delay, 3) if queue_delay is not None else None,
             },
         )

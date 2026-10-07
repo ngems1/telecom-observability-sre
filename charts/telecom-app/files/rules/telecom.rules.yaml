@@ -1,4 +1,4 @@
-# Recording rules and alerts for the telecom usage-alerts platform.
+# Recording rules and alerts for the telecom self-care platform (usage alerts, top-ups, bundles).
 #
 # Single source of truth: mounted into Prometheus by docker-compose and embedded in the
 # Helm chart's PrometheusRule. Edit here only.
@@ -6,6 +6,7 @@
 # SLOs (adjust to what you define in your project):
 #   API availability  99.9 %  non-5xx            -> error budget 0.001
 #   API latency       95 %    of requests < 300ms -> error budget 0.05
+#   Top-up success    95 %    not failed on our side (provider errors/timeouts); customer declines excluded
 #
 # Alerting follows the multi-window, multi-burn-rate method: an alert needs BOTH a long window
 # (is the budget really burning?) and a short window (is it still burning right now?).
@@ -112,9 +113,9 @@ groups:
   - name: telecom.pipeline.alerts
     rules:
       - alert: NotificationConsumerStalled
-        # The producer keeps publishing alert events but the consumer receives nothing.
+        # The producer keeps publishing events (usage alerts, top-ups, bundles) but the consumer receives nothing.
         # Pods stay Ready in this failure mode, so only the producer/consumer comparison catches it.
-        expr: sum(rate(usage_alert_events_total[2m])) > 0 and sum(rate(sqs_messages_received_total[2m])) == 0
+        expr: sum(rate(events_published_total[2m])) > 0 and sum(rate(sqs_messages_received_total[2m])) == 0
         for: 1m
         labels:
           severity: critical
@@ -122,7 +123,7 @@ groups:
           slo: notification-freshness
         annotations:
           summary: "Notification consumer is not receiving messages while events are being produced"
-          description: "usage-api is publishing alert events but notification-service received none in the last 2 minutes. The queue is growing. Pods may look healthy."
+          description: "usage-api is publishing events but notification-service received none in the last 2 minutes. Customers get no usage alerts or top-up confirmations; the queue is growing. Pods may look healthy."
           runbook: "docs/failure-scenarios.md#scenario-3---stuck-queue-processing"
 
       - alert: NotificationWorkerHeartbeatLost
@@ -171,6 +172,58 @@ groups:
           summary: "usage-api cannot publish to SQS"
           description: "Usage is still recorded but alert events are being lost ({{ $value | humanize }} errors/s). Check SQS availability and the IAM role."
           runbook: "docs/failure-scenarios.md"
+
+  - name: telecom.payments.recording
+    interval: 30s
+    rules:
+      # Share of top-ups that failed on OUR side (payment provider error or timeout).
+      # Customer declines are excluded: a declined card is not an outage. NaN (no alert) when nobody tops up.
+      - record: sli:topup_failure_ratio:rate5m
+        expr: |
+          (sum(rate(topups_total{result="failed"}[5m])) or vector(0))
+          /
+          sum(rate(topups_total{result=~"succeeded|failed"}[5m]))
+      - record: sli:topup_decline_ratio:rate10m
+        expr: |
+          (sum(rate(topups_total{result="declined"}[10m])) or vector(0))
+          /
+          sum(rate(topups_total[10m]))
+
+  - name: telecom.payments.alerts
+    rules:
+      - alert: TopUpFailuresHigh
+        expr: sli:topup_failure_ratio:rate5m > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          owner: payments-team
+          slo: topup-success
+        annotations:
+          summary: "Customers cannot top up: {{ $value | humanizePercentage }} of top-ups fail"
+          description: "Top-ups are failing on our side (payment provider errors or timeouts), not because of customer declines. Nobody is charged, but customers cannot add credit. Check the payment provider row on the triage dashboard."
+          runbook: "docs/failure-scenarios.md#scenario-4---payment-provider-degraded"
+
+      - alert: PaymentProviderSlow
+        expr: histogram_quantile(0.95, sum by (le) (rate(payment_provider_duration_seconds_bucket[5m]))) > 1
+        for: 3m
+        labels:
+          severity: warning
+          owner: payments-team
+        annotations:
+          summary: "Payment provider p95 latency is {{ $value | humanizeDuration }}"
+          description: "The external payment provider is slow. Top-ups take longer and start timing out at the configured timeout (HTTP 504). Our API, database and queue are not the cause if their panels are flat."
+          runbook: "docs/failure-scenarios.md#scenario-4---payment-provider-degraded"
+
+      - alert: TopUpDeclinesUnusual
+        expr: sli:topup_decline_ratio:rate10m > 0.25 and sum(rate(topups_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          owner: payments-team
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of top-ups are declined"
+          description: "Customer-side declines are unusually high (normal is a few percent): possibly an issuer or mobile-money outage, or a fraud wave. Not our outage, but customers notice; contact the payment provider."
+          runbook: "docs/failure-scenarios.md#scenario-4---payment-provider-degraded"
 
   - name: telecom.platform.alerts
     rules:

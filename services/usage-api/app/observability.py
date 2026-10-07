@@ -56,6 +56,29 @@ SQS_PUBLISH_LATENCY = Histogram(
 )
 CHAOS_ACTIVE = Gauge("chaos_injection_active", "1 while a failure injection is active", ["type"])
 
+# Every event put on the queue, by type (usage.threshold_crossed, topup.succeeded, topup.failed, bundle.purchased).
+# "Produced vs consumed" panels and the consumer-stalled alert compare this with what the consumer receives.
+EVENTS_PUBLISHED = Counter("events_published_total", "Events published to the queue", ["type"])
+
+# ---- self-care: top-ups, payments, bundles (business and dependency SLIs)
+TOPUPS = Counter(
+    "topups_total",
+    "Top-up attempts by outcome: succeeded, declined (customer side, not an error), failed (our side or provider)",
+    ["method", "result"],
+)
+TOPUP_AMOUNT = Counter("topup_amount_cents_total", "Money credited by successful top-ups (cents)", ["method"])
+TOPUP_REPLAYS = Counter("topup_idempotent_replays_total", "Repeated top-up requests answered from the first result")
+PAYMENT_REQUESTS = Counter(
+    "payment_provider_requests_total", "Calls to the payment provider", ["result"]  # approved|declined|error|timeout
+)
+PAYMENT_LATENCY = Histogram(
+    "payment_provider_duration_seconds",
+    "Payment provider call latency (external dependency)",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0),
+)
+BUNDLES_SOLD = Counter("bundles_sold_total", "Bundles bought from the wallet balance", ["bundle_id"])
+BUNDLE_REVENUE = Counter("bundle_revenue_cents_total", "Money spent on bundles (cents)", ["bundle_id"])
+
 _RESERVED = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
 
 

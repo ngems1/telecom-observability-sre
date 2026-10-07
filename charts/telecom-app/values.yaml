@@ -66,6 +66,8 @@ usageApi:
     sqsQueueUrl: ""
     sqsEndpointUrl: ""   # only for LocalStack/testing
     alertThresholds: "80,100"
+    paymentTimeoutMs: 2000      # give up on the payment provider after this (HTTP 504 to the client)
+    paymentDeclineRate: 0.02    # simulated provider: share of payments the issuer declines (HTTP 402)
     seedSubscribers: 25
     autoMigrate: true
     otelEnabled: false

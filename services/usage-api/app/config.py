@@ -69,6 +69,11 @@ class Settings:
 
     otel_enabled: bool = False
 
+    # Payments (simulated provider). Declines are normal customer outcomes, not errors.
+    currency: str = "USD"
+    payment_timeout_ms: int = 2000
+    payment_decline_rate: float = 0.02
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -88,4 +93,7 @@ class Settings:
             chaos_latency_ms=_env_int("CHAOS_LATENCY_MS", 0),
             chaos_error_rate=_env_float("CHAOS_ERROR_RATE", 0.0),
             otel_enabled=_env_bool("OTEL_ENABLED", False),
+            currency=os.getenv("CURRENCY", "USD"),
+            payment_timeout_ms=_env_int("PAYMENT_TIMEOUT_MS", 2000),
+            payment_decline_rate=_env_float("PAYMENT_DECLINE_RATE", 0.02),
         )

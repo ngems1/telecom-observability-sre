@@ -67,6 +67,10 @@ spec:
             {{- end }}
             - name: ALERT_THRESHOLDS
               value: {{ $svc.config.alertThresholds | quote }}
+            - name: PAYMENT_TIMEOUT_MS
+              value: {{ $svc.config.paymentTimeoutMs | quote }}
+            - name: PAYMENT_DECLINE_RATE
+              value: {{ $svc.config.paymentDeclineRate | quote }}
             - name: SEED_SUBSCRIBERS
               value: {{ $svc.config.seedSubscribers | quote }}
             - name: AUTO_MIGRATE

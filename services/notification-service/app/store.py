@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from .config import Settings
 from .observability import DB_POOL_IN_USE, DB_QUERY_LATENCY
+from .processor import notification_kind
 
 log = logging.getLogger(__name__)
 
@@ -110,8 +111,8 @@ class NotificationStore:
                     event_id=event["event_id"],
                     subscriber_id=event["subscriber_id"],
                     msisdn=event["msisdn"],
-                    kind=event["kind"],
-                    threshold_pct=int(event["threshold_pct"]),
+                    kind=notification_kind(event),
+                    threshold_pct=int(event.get("threshold_pct", 0)),
                     message=message,
                     status="sent",
                     correlation_id=correlation_id[:64],

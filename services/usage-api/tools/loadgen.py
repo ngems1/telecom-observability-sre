@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Small traffic generator for demos and failure tests (standard library only).
+"""Traffic generator for demos and failure tests (standard library only).
 
-Mix of requests that exercises every layer:
-  * reads (subscriber detail, plans)         -> API + database
-  * small usage writes                       -> API + database
+Simulates a normal day of a telecom self-care app, so every layer has realistic traffic:
+  * customers opening the app: account + usage, balance, plans/bundles   -> API + database
+  * network usage records (data / voice / SMS)                            -> API + database (+ SQS on thresholds)
+  * top-ups by card / mobile money / voucher, some double taps (same key) -> API + payment provider + DB + SQS
+  * bundle purchases from the balance (some fail for lack of credit: 402) -> API + database + SQS
   * "bursts": new subscriber pushed past 80% and 100% of its data allowance
-                                             -> API + database + SQS + Notification service
+                                                                          -> API + database + SQS + notifications
 
 Examples:
   python tools/loadgen.py --base-url http://localhost:8080 --rps 5
@@ -24,6 +26,9 @@ import uuid
 from collections import Counter
 
 BASIC_DATA_QUOTA_MB = 2048  # plan "basic"
+TOPUP_AMOUNTS_CENTS = (500, 1000, 1000, 2000, 2000, 5000)
+PAYMENT_METHODS = (("card", 0.6), ("mobile_money", 0.3), ("voucher", 0.1))
+BUNDLE_IDS = ("data-1gb", "data-1gb", "data-5gb", "voice-100", "sms-200")
 
 
 class Stats:
@@ -47,7 +52,9 @@ class Stats:
         return lat, st
 
 
-def call(base: str, method: str, path: str, body: dict | None, stats: Stats, timeout: float) -> tuple[int, dict | None]:
+def call(
+    base: str, method: str, path: str, body: dict | None, stats: Stats, timeout: float, headers: dict | None = None
+) -> tuple[int, dict | None]:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         base + path,
@@ -56,6 +63,7 @@ def call(base: str, method: str, path: str, body: dict | None, stats: Stats, tim
         headers={
             "Content-Type": "application/json",
             "X-Correlation-ID": f"loadgen-{uuid.uuid4().hex[:12]}",
+            **(headers or {}),
         },
     )
     start = time.perf_counter()
@@ -97,17 +105,35 @@ def burst(base: str, stats: Stats, timeout: float) -> None:
          {"subscriber_id": sub["id"], "kind": "data", "amount": int(BASIC_DATA_QUOTA_MB * 0.2)}, stats, timeout)
 
 
+def top_up(base: str, ids: list[str], stats: Stats, timeout: float) -> None:
+    """A customer tops up; 1 in 10 taps "pay" twice, which must not charge twice (same Idempotency-Key)."""
+    method = random.choices([m for m, _ in PAYMENT_METHODS], weights=[w for _, w in PAYMENT_METHODS])[0]
+    body = {"subscriber_id": random.choice(ids), "amount_cents": random.choice(TOPUP_AMOUNTS_CENTS), "payment_method": method}
+    headers = {"Idempotency-Key": f"app-{uuid.uuid4().hex}"}
+    call(base, "POST", "/v1/topups", body, stats, timeout, headers)
+    if random.random() < 0.10:
+        call(base, "POST", "/v1/topups", body, stats, timeout, headers)
+
+
 def one_request(base: str, ids: list[str], stats: Stats, timeout: float) -> None:
     roll = random.random()
-    if roll < 0.60:
-        call(base, "GET", f"/v1/subscribers/{random.choice(ids)}", None, stats, timeout)
-    elif roll < 0.75:
-        call(base, "GET", "/v1/plans", None, stats, timeout)
-    elif roll < 0.95:
+    sub_id = random.choice(ids)
+    if roll < 0.35:      # open the app: plan usage, balance and active bundles
+        call(base, "GET", f"/v1/subscribers/{sub_id}", None, stats, timeout)
+    elif roll < 0.45:    # balance widget
+        call(base, "GET", f"/v1/subscribers/{sub_id}/balance", None, stats, timeout)
+    elif roll < 0.50:    # browse offers
+        call(base, "GET", random.choice(["/v1/plans", "/v1/bundles"]), None, stats, timeout)
+    elif roll < 0.53:    # top-up history
+        call(base, "GET", f"/v1/subscribers/{sub_id}/topups", None, stats, timeout)
+    elif roll < 0.75:    # usage records coming from the network
         kind = random.choice(["data", "voice", "sms"])
         amount = {"data": random.randint(1, 20), "voice": random.randint(1, 3), "sms": 1}[kind]
-        call(base, "POST", "/v1/usage",
-             {"subscriber_id": random.choice(ids), "kind": kind, "amount": amount}, stats, timeout)
+        call(base, "POST", "/v1/usage", {"subscriber_id": sub_id, "kind": kind, "amount": amount}, stats, timeout)
+    elif roll < 0.87:
+        top_up(base, ids, stats, timeout)
+    elif roll < 0.95:    # buy a bundle (402 when the balance is too low: a normal outcome)
+        call(base, "POST", f"/v1/subscribers/{sub_id}/bundles", {"bundle_id": random.choice(BUNDLE_IDS)}, stats, timeout)
     else:
         burst(base, stats, timeout)
 

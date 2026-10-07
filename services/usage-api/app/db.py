@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 
 from .config import Settings
 from .logic import KINDS
-from .models import Base, Plan, Subscriber, UsageTotal
+from .models import Base, Plan, Subscriber, UsageTotal, Wallet
 from .observability import DB_POOL_IN_USE, DB_QUERY_LATENCY
 
 log = logging.getLogger(__name__)
@@ -114,8 +114,17 @@ def seed(session_factory: sessionmaker[Session], subscriber_count: int) -> None:
     for i in range(subscriber_count):
         msisdn = f"+155501{i:05d}"
         sub_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, msisdn))  # deterministic across replicas
+        opening_balance = 500 + (i * 731) % 3000  # 5.00 to 34.99, varied so bundle purchases sometimes fail
         with session_factory() as db:
-            if db.scalar(select(Subscriber.id).where(Subscriber.msisdn == msisdn)):
+            existing = db.scalar(select(Subscriber.id).where(Subscriber.msisdn == msisdn))
+            if existing:
+                # Databases created before wallets existed: give seeded subscribers their opening balance once.
+                if db.get(Wallet, existing) is None:
+                    db.add(Wallet(subscriber_id=existing, balance_cents=opening_balance))
+                    try:
+                        db.commit()
+                    except Exception:  # noqa: BLE001 - another replica did it first
+                        db.rollback()
                 continue
             db.add(
                 Subscriber(
@@ -127,6 +136,7 @@ def seed(session_factory: sessionmaker[Session], subscriber_count: int) -> None:
             )
             for kind in KINDS:
                 db.add(UsageTotal(subscriber_id=sub_id, kind=kind, used=0))
+            db.add(Wallet(subscriber_id=sub_id, balance_cents=opening_balance))
             try:
                 db.commit()
             except Exception:  # noqa: BLE001 - another replica seeded first

@@ -1,4 +1,4 @@
-# Telecom Usage-Alerts Platform
+# Telecom Self-Care & Top-Up Platform
 
 The application layer for the **Week 4 project: Telecom Observability & SRE Platform for EKS**.
 
@@ -25,12 +25,15 @@ consumer. When something breaks you must be able to say *which layer* broke.
                                                           +----------------------+
 ```
 
-**Story:** subscribers consume data / voice / SMS against their plan. When usage crosses **80 %** or **100 %**
-of an allowance, the API publishes an event; the Notification service turns it into a customer message.
+**Story (a normal day for a mobile operator's self-care app):** customers open the app to check their usage and
+prepaid balance, **top up** by card, mobile money or voucher, **buy add-on bundles** (1 GB, 100 minutes, ...) from their
+balance, and get SMS notifications: "you have used 80 % of your data", "top-up successful, new balance $23.50",
+"you bought 1 GB data". Top-ups go through an external **payment provider** and are **idempotent** (a double tap on
+"Pay" charges once). Usage records arrive from the network all day.
 
 | Service | Role | Port | Scaling signal |
 |---|---|---|---|
-| `usage-api` | REST API, owns plans / subscribers / usage in PostgreSQL, publishes events to SQS | 8080 | CPU (HPA) |
+| `usage-api` | Self-care REST API: plans, subscribers, usage, wallet balance, top-ups (via the payment provider), bundles. Owns PostgreSQL tables, publishes events to SQS | 8080 | CPU (HPA) |
 | `notification-service` | Long-polling SQS consumer, idempotent, writes an audit log, "sends" the notification | 8081 (probes + metrics only) | queue depth/age (KEDA later) |
 
 ## Project deliverables map
@@ -127,8 +130,15 @@ Stop everything: `docker compose --profile loadgen --profile observability down 
 | `GET /healthz` | Liveness - process is up; does **not** touch the database |
 | `GET /readyz` | Readiness - database reachable (critical). Queue state is reported (`ok` / `degraded`) but never fails readiness |
 | `GET /metrics` | Prometheus metrics |
-| `GET /v1/plans`, `GET /v1/subscribers?limit=`, `POST /v1/subscribers`, `GET /v1/subscribers/{id}` | Reference data and usage summary |
-| `POST /v1/usage` | Record usage `{subscriber_id, kind: data\|voice\|sms, amount}`; returns which alerts were published |
+| `GET /v1/plans`, `GET /v1/bundles` | Plans and the add-on bundle catalogue |
+| `GET /v1/subscribers?msisdn=` , `POST /v1/subscribers` | Find an account by phone number, create a subscriber (starts with a 0 balance) |
+| `GET /v1/subscribers/{id}` | **Self-care home screen**: usage per kind (plan + active bundles), balance, active bundles |
+| `GET /v1/subscribers/{id}/balance` | Prepaid balance |
+| `POST /v1/topups` + header `Idempotency-Key` | Top up `{subscriber_id, amount_cents (100-20000), payment_method: card\|mobile_money\|voucher}`. 201 credited, 402 declined by the bank, 502/504 payment provider error/timeout, **200 + `Idempotent-Replayed: true`** when the same key is sent again (nothing charged twice) |
+| `GET /v1/topups/{id}`, `GET /v1/subscribers/{id}/topups` | Top-up status and history |
+| `POST /v1/subscribers/{id}/bundles` | Buy a bundle `{bundle_id}` from the balance: 201, or 402 when the balance is too low |
+| `POST /v1/usage` | Record usage `{subscriber_id, kind: data\|voice\|sms, amount}` (from the network); returns which alerts were published |
+| `POST /chaos/payments` | Degrade the payment provider `{latency_ms, error_rate, decline_rate}` (scenario 4) |
 | `/chaos/*`, `/demo/*` | Failure injection and demo helpers - only when `CHAOS_ENABLED=true` |
 
 Interactive docs: <http://localhost:8080/docs>.
@@ -221,6 +231,9 @@ Purple markers on every graph show when a failure injection was active, so you c
 | `SqsPublishErrors` | critical | platform-sre | the API cannot publish to SQS |
 | `TargetDown` | critical | platform-sre | a service is not being scraped |
 | `DatabaseQueriesSlow` | warning | data-platform | p95 query time above 250 ms |
+| `TopUpFailuresHigh` | critical | payments-team | more than 5% of top-ups fail on our side (provider errors/timeouts; declines excluded) |
+| `PaymentProviderSlow` | warning | payments-team | payment provider p95 above 1 s |
+| `TopUpDeclinesUnusual` | warning | payments-team | more than 25% of top-ups declined by banks/wallets for 10 min |
 | `ChaosInjectionActive` | info | platform-sre | a deliberate failure test is on (explains the other alerts) |
 
 The burn-rate alerts use the multi-window, multi-burn-rate method: a long window proves the budget is really being

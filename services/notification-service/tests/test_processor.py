@@ -4,7 +4,7 @@ import time
 import unittest
 
 from app.chaos import DeliveryError
-from app.processor import InvalidEvent, MessageHandler, Outcome, parse_event, render_message
+from app.processor import InvalidEvent, MessageHandler, Outcome, notification_kind, parse_event, render_message
 
 
 def make_event(**overrides):
@@ -130,6 +130,64 @@ class HandlerTests(unittest.TestCase):
         outcome = handler.handle(json.dumps(make_event()), self.attrs())
         self.assertEqual(outcome, Outcome.ERROR)
         self.assertFalse(outcome.delete_message)
+
+
+
+def topup_event(**overrides):
+    event = {
+        "event_id": "evt-t1",
+        "type": "topup.succeeded",
+        "subscriber_id": "sub-1",
+        "msisdn": "+15550100001",
+        "topup_id": "top-1",
+        "amount_cents": 1000,
+        "currency": "USD",
+        "balance_cents": 2350,
+    }
+    event.update(overrides)
+    return event
+
+
+class SelfCareEventTests(unittest.TestCase):
+    def test_topup_succeeded_message(self):
+        event = parse_event(json.dumps(topup_event()))
+        self.assertEqual(render_message(event), "Top-up successful: $10.00 added. Your balance is now $23.50.")
+        self.assertEqual(notification_kind(event), "topup")
+
+    def test_topup_declined_and_failed_messages(self):
+        declined = topup_event(type="topup.failed", reason="declined")
+        del declined["balance_cents"]
+        self.assertIn("declined by your bank", render_message(parse_event(json.dumps(declined))))
+        failed = dict(declined, reason="provider_timeout")
+        self.assertIn("could not be completed", render_message(parse_event(json.dumps(failed))))
+        self.assertIn("not been charged", render_message(failed))
+
+    def test_bundle_purchased_message(self):
+        event = topup_event(type="bundle.purchased", bundle_name="1 GB data", price_cents=500, balance_cents=1850)
+        text = render_message(parse_event(json.dumps(event)))
+        self.assertEqual(text, "You bought 1 GB data for $5.00. Remaining balance: $18.50.")
+        self.assertEqual(notification_kind(event), "bundle")
+
+    def test_usage_kind_is_kept(self):
+        self.assertEqual(notification_kind(make_event()), "data")
+
+    def test_unknown_event_type_is_invalid(self):
+        with self.assertRaises(InvalidEvent):
+            parse_event(json.dumps(topup_event(type="refund.issued")))
+
+    def test_topup_event_missing_its_fields_is_invalid(self):
+        event = topup_event()
+        del event["amount_cents"]
+        with self.assertRaises(InvalidEvent) as ctx:
+            parse_event(json.dumps(event))
+        self.assertIn("amount_cents", str(ctx.exception))
+
+    def test_handler_sends_topup_notification(self):
+        store, notifier = FakeStore(), FakeNotifier()
+        outcome = MessageHandler(store, notifier).handle(json.dumps(topup_event()), {}, None)
+        self.assertEqual(outcome, Outcome.SENT)
+        self.assertEqual(notifier.delivered[0][0], "+15550100001")
+        self.assertIn("Top-up successful", notifier.delivered[0][1])
 
 
 if __name__ == "__main__":

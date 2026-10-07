@@ -23,6 +23,7 @@ SQS_DELETE_ERRORS = Counter("sqs_delete_errors_total", "Failed SQS delete calls"
 
 # result: sent | duplicate | invalid | delivery_failed | error
 PROCESSED = Counter("notifications_processed_total", "Messages processed", ["result"])
+SENT_BY_TYPE = Counter("notifications_sent_by_type_total", "Notifications delivered, by event type", ["event_type"])
 PROCESSING_SECONDS = Histogram(
     "notification_processing_seconds",
     "Time to process one message",

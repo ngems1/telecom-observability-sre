@@ -2,7 +2,17 @@
 import unittest
 from datetime import datetime, timezone
 
-from app.logic import EVENT_TYPE, build_event, crossed_thresholds, percent_used
+from app.logic import (
+    BUNDLES,
+    EVENT_TYPE,
+    TOPUP_SUCCEEDED,
+    build_event,
+    crossed_thresholds,
+    effective_quota,
+    format_money,
+    new_event,
+    percent_used,
+)
 
 
 class CrossedThresholdsTests(unittest.TestCase):
@@ -61,6 +71,40 @@ class HelpersTests(unittest.TestCase):
         self.assertEqual(event["correlation_id"], "abc")
         self.assertEqual(event["occurred_at"], now.isoformat())
         self.assertTrue(event["event_id"])
+
+
+
+class SelfCareLogicTests(unittest.TestCase):
+    def test_effective_quota_adds_active_bundles(self):
+        self.assertEqual(effective_quota(2048, []), 2048)
+        self.assertEqual(effective_quota(2048, [1024, 5120]), 8192)
+        self.assertEqual(effective_quota(200, [0, -5]), 200)  # nothing negative sneaks in
+
+    def test_bundle_raises_quota_so_thresholds_can_fire_again(self):
+        # 1700 / 2048 MB was past 80%; after a 1 GB bundle the quota is 3072 and 80% is 2457.6 MB.
+        quota = effective_quota(2048, [BUNDLES["data-1gb"]["amount"]])
+        self.assertEqual(crossed_thresholds(1700, 2000, quota), [])
+        self.assertEqual(crossed_thresholds(2000, 2500, quota), [80])
+
+    def test_bundle_catalogue_is_consistent(self):
+        for bundle_id, b in BUNDLES.items():
+            self.assertIn(b["kind"], ("data", "voice", "sms"), bundle_id)
+            self.assertGreater(b["amount"], 0)
+            self.assertGreater(b["price_cents"], 0)
+            self.assertLessEqual(len(bundle_id), 32)
+
+    def test_format_money(self):
+        self.assertEqual(format_money(1050), "$10.50")
+        self.assertEqual(format_money(123456, "EUR"), "€1,234.56")
+        self.assertEqual(format_money(500, "XOF"), "5.00 XOF")
+
+    def test_new_event_envelope(self):
+        event = new_event(TOPUP_SUCCEEDED, "corr-9", subscriber_id="s1", amount_cents=1000)
+        self.assertEqual(event["type"], "topup.succeeded")
+        self.assertEqual(event["correlation_id"], "corr-9")
+        self.assertEqual(event["amount_cents"], 1000)
+        self.assertEqual(event["version"], 1)
+        self.assertTrue(event["event_id"] and event["occurred_at"])
 
 
 if __name__ == "__main__":

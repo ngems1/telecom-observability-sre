@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
@@ -20,7 +20,9 @@ from .chaos import ChaosState
 from .config import Settings
 from .db import init_db, make_engine, make_session_factory
 from .events import build_publisher
-from .models import Plan, Subscriber
+from .logic import BUNDLES
+from .models import Plan, Subscriber, TopUp
+from .payments import SimulatedPaymentProvider
 from .observability import (
     HTTP_IN_FLIGHT,
     HTTP_LATENCY,
@@ -30,10 +32,16 @@ from .observability import (
     setup_tracing,
 )
 from .schemas import (
+    BalanceOut,
+    BundleOut,
+    BundlePurchaseIn,
+    BundlePurchaseOut,
     PlanOut,
     SubscriberDetail,
     SubscriberIn,
     SubscriberOut,
+    TopUpIn,
+    TopUpOut,
     UsageIn,
     UsageOut,
 )
@@ -53,6 +61,23 @@ class LatencyIn(BaseModel):
 
 class ErrorsIn(BaseModel):
     rate: float = Field(ge=0, le=1)
+
+
+class PaymentsChaosIn(BaseModel):
+    latency_ms: int = Field(default=0, ge=0, le=30000)
+    error_rate: float = Field(default=0.0, ge=0, le=1)
+    decline_rate: float = Field(default=0.0, ge=0, le=1)
+
+
+# HTTP status for each top-up outcome. Declines are the customer's bank saying no (4xx, not an SLO error);
+# provider failures are ours to fix (5xx: they burn the availability budget and page someone).
+TOPUP_STATUS_CODES = {
+    "succeeded": 201,
+    "declined": 402,
+    "provider_error": 502,
+    "provider_timeout": 504,
+}
+IDEMPOTENCY_KEY_PATTERN = r"^[A-Za-z0-9_.:-]{1,64}$"
 
 
 def _route_label(app: FastAPI, request: Request) -> str:
@@ -75,6 +100,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     session_factory = make_session_factory(engine)
     publisher = build_publisher(settings)
     chaos = ChaosState(latency_ms=settings.chaos_latency_ms, error_rate=settings.chaos_error_rate)
+    payments = SimulatedPaymentProvider(
+        timeout_s=settings.payment_timeout_ms / 1000, decline_rate=settings.payment_decline_rate
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -189,8 +217,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return db.scalars(select(Plan).order_by(Plan.monthly_price_cents)).all()
 
     @app.get("/v1/subscribers", response_model=list[SubscriberOut], tags=["subscribers"])
-    def list_subscribers(limit: int = Query(50, ge=1, le=500), db: Session = Depends(get_db)):
-        return db.scalars(select(Subscriber).order_by(Subscriber.msisdn).limit(limit)).all()
+    def list_subscribers(
+        limit: int = Query(50, ge=1, le=500),
+        msisdn: str | None = Query(None, pattern=r"^\+?[0-9]{8,15}$", description="Find the account of a phone number"),
+        db: Session = Depends(get_db),
+    ):
+        stmt = select(Subscriber).order_by(Subscriber.msisdn).limit(limit)
+        if msisdn:
+            stmt = stmt.where(Subscriber.msisdn == msisdn)
+        return db.scalars(stmt).all()
 
     @app.post("/v1/subscribers", response_model=SubscriberOut, status_code=201, tags=["subscribers"])
     def create_subscriber(body: SubscriberIn, db: Session = Depends(get_db)):
@@ -206,13 +241,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sub = db.get(Subscriber, subscriber_id)
         if sub is None:
             raise HTTPException(status_code=404, detail="subscriber not found")
-        return SubscriberDetail(
+        wallet = service.get_wallet(db, sub.id)
+        detail = SubscriberDetail(
             id=sub.id,
             msisdn=sub.msisdn,
             name=sub.name,
             plan_id=sub.plan_id,
             usage=service.usage_summary(db, sub),
+            balance_cents=wallet.balance_cents,
+            currency=wallet.currency,
+            active_bundles=service.active_bundles(db, sub.id),
         )
+        db.commit()  # persists a wallet created for a subscriber that predates wallets
+        return detail
 
     @app.post("/v1/usage", response_model=UsageOut, status_code=201, tags=["usage"])
     def record_usage(body: UsageIn, db: Session = Depends(get_db)):
@@ -229,12 +270,118 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except service.NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    # ------------------------------------------------------------------ self-care: balance, top-ups, bundles
+    @app.get("/v1/subscribers/{subscriber_id}/balance", response_model=BalanceOut, tags=["self-care"])
+    def get_balance(subscriber_id: str, db: Session = Depends(get_db)):
+        try:
+            service.get_subscriber(db, subscriber_id)
+        except service.NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        wallet = service.get_wallet(db, subscriber_id)
+        db.commit()
+        return BalanceOut(subscriber_id=subscriber_id, balance_cents=wallet.balance_cents, currency=wallet.currency)
+
+    @app.post(
+        "/v1/topups",
+        response_model=TopUpOut,
+        status_code=201,
+        tags=["self-care"],
+        responses={
+            200: {"description": "Repeated request (same Idempotency-Key): the first result, nothing charged again"},
+            402: {"description": "Payment declined by the customer's bank or wallet"},
+            502: {"description": "Payment provider error"},
+            504: {"description": "Payment provider timeout"},
+        },
+    )
+    def create_topup(
+        body: TopUpIn,
+        response: Response,
+        idempotency_key: str | None = Header(
+            default=None,
+            alias="Idempotency-Key",
+            pattern=IDEMPOTENCY_KEY_PATTERN,
+            description="Client-generated key. Send the same key when retrying so the customer is charged once.",
+        ),
+        db: Session = Depends(get_db),
+    ):
+        try:
+            topup, replayed = service.request_topup(
+                db,
+                publisher,
+                payments,
+                subscriber_id=body.subscriber_id,
+                amount_cents=body.amount_cents,
+                method=body.payment_method,
+                idempotency_key=idempotency_key or f"server-{uuid.uuid4()}",
+                currency=settings.currency,
+                correlation_id=correlation_id_var.get(),
+            )
+        except service.NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if replayed:
+            response.status_code = 200
+            response.headers["Idempotent-Replayed"] = "true"
+        else:
+            response.status_code = TOPUP_STATUS_CODES.get(
+                "succeeded" if topup.status == "succeeded" else topup.failure_reason or "provider_error", 502
+            )
+        return topup
+
+    @app.get("/v1/topups/{topup_id}", response_model=TopUpOut, tags=["self-care"])
+    def get_topup(topup_id: str, db: Session = Depends(get_db)):
+        topup = db.get(TopUp, topup_id)
+        if topup is None:
+            raise HTTPException(status_code=404, detail="top-up not found")
+        return topup
+
+    @app.get("/v1/subscribers/{subscriber_id}/topups", response_model=list[TopUpOut], tags=["self-care"])
+    def topup_history(subscriber_id: str, limit: int = Query(20, ge=1, le=100), db: Session = Depends(get_db)):
+        try:
+            return service.list_topups(db, subscriber_id, limit)
+        except service.NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/v1/bundles", response_model=list[BundleOut], tags=["self-care"])
+    def list_bundles():
+        return [BundleOut(id=bundle_id, **{k: b[k] for k in ("name", "kind", "amount", "price_cents")})
+                for bundle_id, b in BUNDLES.items()]
+
+    @app.post(
+        "/v1/subscribers/{subscriber_id}/bundles",
+        response_model=BundlePurchaseOut,
+        status_code=201,
+        tags=["self-care"],
+        responses={402: {"description": "Balance too low: top up first"}},
+    )
+    def buy_bundle(subscriber_id: str, body: BundlePurchaseIn, db: Session = Depends(get_db)):
+        try:
+            return service.purchase_bundle(
+                db,
+                publisher,
+                subscriber_id=subscriber_id,
+                bundle_id=body.bundle_id,
+                currency=settings.currency,
+                correlation_id=correlation_id_var.get(),
+            )
+        except service.NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except service.InsufficientFunds as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
+
     # ------------------------------------------------------------------ chaos / demo tools
     if settings.chaos_enabled:
 
         @app.get("/chaos", tags=["chaos"])
         def chaos_status():
-            return chaos.snapshot()
+            return {**chaos.snapshot(), "payments": payments.chaos_snapshot()}
+
+        @app.post("/chaos/payments", tags=["chaos"])
+        def chaos_payments(body: PaymentsChaosIn):
+            """Degrade the payment provider: slow (latency_ms; above the timeout = 504), failing (error_rate = 502)
+            or declining more cards (decline_rate = 402)."""
+            payments.set_chaos(body.latency_ms, body.error_rate, body.decline_rate)
+            log.warning("chaos: payment provider degraded", extra=payments.chaos_snapshot())
+            return payments.chaos_snapshot()
 
         @app.post("/chaos/latency", tags=["chaos"])
         def chaos_latency(body: LatencyIn):
@@ -251,8 +398,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         @app.post("/chaos/reset", tags=["chaos"])
         def chaos_reset():
             chaos.reset()
+            payments.reset_chaos()
             log.warning("chaos: all injections cleared")
-            return chaos.snapshot()
+            return {**chaos.snapshot(), "payments": payments.chaos_snapshot()}
 
         @app.post("/chaos/poison-message", tags=["chaos"])
         def chaos_poison(kind: Literal["malformed", "incomplete"] = "malformed"):
@@ -280,7 +428,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         @app.post("/demo/reset-usage", tags=["demo"])
         def demo_reset_usage(db: Session = Depends(get_db)):
-            """Start a new allowance cycle so threshold alerts can fire again."""
+            """Start a new allowance cycle (usage to 0, bundles expire) so threshold alerts can fire again."""
             return {"reset_rows": service.reset_usage(db)}
 
     return app

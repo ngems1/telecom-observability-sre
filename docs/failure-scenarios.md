@@ -1,6 +1,7 @@
 # Failure scenarios and recovery runbook
 
-Three required scenarios (pod failure, elevated latency, stuck queue) plus two bonus ones.
+Three required scenarios (pod failure, elevated latency, stuck queue), a payment-provider incident for the
+self-care top-up flow, plus two bonus ones.
 Each one follows the same shape: **inject → detect → isolate the layer → recover → capture evidence.**
 
 For the final demo, pick one scenario and tell it as a story: *"An alert fired. Here is how I found
@@ -165,6 +166,54 @@ In a real incident, the equivalent action is restarting the consumer pods (`kube
 **Evidence:** queue depth and age curves, the "pod healthy but queue growing" contrast, drain time after recovery.
 
 **Lesson to state:** pod and API health do not prove the pipeline works - alert on **queue age**, not just pod status.
+
+---
+
+## Scenario 4 - Payment provider degraded
+
+**Injected failure:** the external payment provider behind top-ups becomes slow, then starts failing.
+Everything we run is healthy; customers simply cannot add credit.
+
+**Inject** (on `usage-api`, port 8080)
+
+```bash
+# slow: 2.5 s per payment, above our 2 s timeout -> top-ups answer 504
+curl -XPOST localhost:8080/chaos/payments -H 'content-type: application/json' -d '{"latency_ms": 2500}'
+# or failing: half of the payments get a provider error -> 502
+curl -XPOST localhost:8080/chaos/payments -H 'content-type: application/json' -d '{"error_rate": 0.5}'
+# or an issuer outage: most cards declined -> 402 (customer-side, not our SLO)
+curl -XPOST localhost:8080/chaos/payments -H 'content-type: application/json' -d '{"decline_rate": 0.6}'
+```
+
+**What you should see**
+
+- `TopUpFailuresHigh` (critical, payments-team) after ~2 minutes; `PaymentProviderSlow` (warning) for the latency case.
+- *SLO Overview*, row *Self-care: top-ups and payments*: top-up success drops, "failed" appears in *Top-ups by outcome*,
+  *Money in per hour* falls: the business impact in one picture.
+- The API availability burn rate rises too (502/504 are server errors), but only on the `/v1/topups` route.
+- The decline case raises `TopUpDeclinesUnusual` instead and does **not** burn the availability SLO: a declined card is
+  the customer's bank saying no, not our outage.
+
+**Isolate the layer** (*Service Triage*, row 5)
+
+| Check | Result | Conclusion |
+|---|---|---|
+| p95 of `POST /v1/topups` vs every other route | only top-ups are slow | not the nodes, not the API as a whole |
+| DB p95 query time, queue publish latency | flat | not the database, not SQS |
+| Payment provider p95 / results | p95 at the 2 s timeout, or `error` / `timeout` results | **the external payment provider** |
+
+**Recover**
+
+```bash
+curl -XPOST localhost:8080/chaos/reset
+```
+
+In a real incident you cannot fix the provider: you contact them, show a "top-ups temporarily unavailable" banner,
+and, if the provider supports it, fail over to a second payment route. Nobody was charged for failed top-ups
+(no wallet credit, no money taken), and customers who retried with the same `Idempotency-Key` were not charged twice.
+
+**Lesson to state:** an external dependency needs its own latency/error metrics and its own SLO; otherwise the
+incident looks like "the API is slow" and the wrong team gets paged.
 
 ---
 
